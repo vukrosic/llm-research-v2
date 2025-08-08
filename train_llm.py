@@ -429,6 +429,14 @@ def save_checkpoint(model: nn.Module, optimizers: list, schedulers: list, step: 
 
 def upload_to_huggingface(checkpoint_path: str, repo_name: str, step: int, token: str = None):
     """Upload checkpoint to Hugging Face Hub"""
+    if not repo_name:
+        print("❌ Cannot upload: No repository name provided")
+        return
+    
+    if not token:
+        print("❌ Cannot upload: No Hugging Face token provided")
+        return
+    
     try:
         api = HfApi(token=token)
         
@@ -452,7 +460,7 @@ def upload_to_huggingface(checkpoint_path: str, repo_name: str, step: int, token
         
     except Exception as e:
         print(f"❌ Failed to upload to Hugging Face: {e}")
-        print("Make sure your HF token has write permissions")
+        print("Make sure your HF token has write permissions and the repo name is correct")
 
 def setup_muon_optimizer(model: nn.Module, config: ModelConfig):
     """Setup Muon optimizer with hybrid approach"""
@@ -611,8 +619,10 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
                             model, optimizers, schedulers, step, config, current_metrics
                         )
                         
-                        if config.push_to_hub and config.hf_repo_name:
+                        if config.push_to_hub and config.hf_repo_name and config.hf_token:
                             upload_to_huggingface(checkpoint_path, config.hf_repo_name, step, config.hf_token)
+                        elif config.push_to_hub and (not config.hf_repo_name or not config.hf_token):
+                            print("⚠️ Hugging Face upload requested but missing repo name or token. Skipping upload.")
                         
                         early_stopped = True
                         break  # Exit inner training loop
@@ -636,9 +646,11 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
                     model, optimizers, schedulers, step, config, current_metrics
                 )
                 
-                # Upload to Hugging Face if enabled
-                if config.push_to_hub and config.hf_repo_name:
+                # Upload to Hugging Face if enabled and configured
+                if config.push_to_hub and config.hf_repo_name and config.hf_token:
                     upload_to_huggingface(checkpoint_path, config.hf_repo_name, step, config.hf_token)
+                elif config.push_to_hub and (not config.hf_repo_name or not config.hf_token):
+                    print("⚠️ Hugging Face upload requested but missing repo name or token. Skipping upload.")
 
             step += 1
             if step % 100 == 0:
@@ -697,8 +709,10 @@ if __name__ == "__main__":
     print(f"   Training: {config.max_steps} steps, batch size {config.batch_size}")
     print(f"   Data: {config.max_tokens:,} tokens, seq_len {config.max_seq_len}")
     print(f"   Checkpoints: Save every {config.save_every} steps")
-    if config.push_to_hub and config.hf_repo_name:
+    if config.push_to_hub and config.hf_repo_name and config.hf_token:
         print(f"   🤗 Hugging Face: Will upload to {config.hf_repo_name}")
+    elif config.push_to_hub:
+        print(f"   ⚠️ Hugging Face upload enabled but missing credentials - will train locally only")
     else:
         print(f"   💾 Local only: Configure .env file to upload to HF")
 
