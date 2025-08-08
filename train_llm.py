@@ -17,6 +17,7 @@ import warnings
 import os
 import pickle
 import json
+import glob
 from dotenv import load_dotenv
 warnings.filterwarnings('ignore')
 
@@ -669,15 +670,20 @@ if __name__ == "__main__":
     config = ModelConfig()
     
     # Configure Hugging Face settings from environment
-    config.hf_repo_name = os.getenv('HF_REPO_NAME', 'vukrosic/blueberry-1')
+    config.hf_repo_name = os.getenv('HF_REPO_NAME')
     config.hf_token = os.getenv('HF_TOKEN')
     config.push_to_hub = os.getenv('PUSH_TO_HUB', 'false').lower() == 'true'
     config.save_every = int(os.getenv('SAVE_EVERY', '1000'))
     
-    # Resume from latest checkpoint if available
-    latest_checkpoint = "checkpoints/checkpoint-14999"  # Your latest checkpoint
-    if os.path.exists(latest_checkpoint):
-        resume_choice = input(f"Found checkpoint at {latest_checkpoint}. Resume training? (y/n): ").strip().lower()
+    # Check for existing checkpoints and offer to resume
+    checkpoints = glob.glob("checkpoints/checkpoint-*")
+    if checkpoints:
+        # Sort by step number and get the latest
+        checkpoints.sort(key=lambda x: int(x.split('-')[-1]))
+        latest_checkpoint = checkpoints[-1]
+        step_num = latest_checkpoint.split('-')[-1]
+        
+        resume_choice = input(f"Found checkpoint at step {step_num}. Resume training? (y/n): ").strip().lower()
         if resume_choice == 'y':
             config.resume_from_checkpoint = latest_checkpoint
             print(f"🔄 Will resume from {latest_checkpoint}")
@@ -691,10 +697,10 @@ if __name__ == "__main__":
     print(f"   Training: {config.max_steps} steps, batch size {config.batch_size}")
     print(f"   Data: {config.max_tokens:,} tokens, seq_len {config.max_seq_len}")
     print(f"   Checkpoints: Save every {config.save_every} steps")
-    if config.push_to_hub:
+    if config.push_to_hub and config.hf_repo_name:
         print(f"   🤗 Hugging Face: Will upload to {config.hf_repo_name}")
     else:
-        print(f"   💾 Local only: Set push_to_hub=True to upload to HF")
+        print(f"   💾 Local only: Configure .env file to upload to HF")
 
     # Load data
     texts, tokenizer, tokens = load_and_cache_data(config)
