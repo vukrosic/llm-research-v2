@@ -580,7 +580,7 @@ if __name__ == "__main__":
     config = ModelConfig()
     
     # Configure Hugging Face settings
-    config.hf_repo_name = "your-username/minimal-llm-training"  # Change this to your repo
+    config.hf_repo_name = "vukrosic/blueberry-1"  # Change this to your repo
     config.push_to_hub = True  # Set to True to enable uploads
     config.save_every = 1000  # Save every 1000 steps
     
