@@ -79,6 +79,8 @@ Get your HF token from: https://huggingface.co/settings/tokens
 ```
 ├── train_llm.py       # Training script with Muon optimizer
 ├── inference.py       # Text generation and model loading
+├── upload_to_hf.py    # Upload checkpoints to Hugging Face
+├── example_usage.py   # Example workflow script
 ├── setup.py          # Easy setup script
 ├── requirements.txt   # Python dependencies
 ├── .env.example      # Environment variables template
@@ -89,7 +91,7 @@ Get your HF token from: https://huggingface.co/settings/tokens
 
 - **21M parameter transformer model** (384d, 6 layers, 8 heads)
 - **Muon optimizer** for efficient training
-- **Automatic checkpointing** every 1000 steps
+- **Automatic checkpointing** every 5000 steps
 - **Resume training** from any checkpoint
 - **Interactive text generation**
 - **Hugging Face integration** (optional)
@@ -176,11 +178,60 @@ Check your token permissions:
 4. **Scale up** - Increase model size for better performance
 5. **Share your model** - Upload to Hugging Face for others to use
 
+## 📦 Checkpoint Management
+
+### Automatic Checkpointing
+The training script now saves checkpoints every 5000 steps in the `checkpoints/` directory:
+```
+checkpoints/
+├── checkpoint_step_5000/
+│   ├── model.pt          # Model weights and optimizer state
+│   ├── config.json       # Model configuration
+│   └── tokenizer files   # Tokenizer configuration
+├── checkpoint_step_10000/
+└── checkpoint_step_15000/
+```
+
+### Upload to Hugging Face
+Share your trained models with the community:
+
+```bash
+# Set your Hugging Face token
+export HF_TOKEN="hf_your_token_here"
+
+# List available checkpoints
+python upload_to_hf.py --list
+
+# Upload latest checkpoint
+python upload_to_hf.py --repo-name username/my-awesome-model
+
+# Upload specific checkpoint
+python upload_to_hf.py --repo-name username/my-model --checkpoint checkpoints/checkpoint_step_10000
+
+# Create private repository
+python upload_to_hf.py --repo-name username/my-model --private
+```
+
+Get your token from: https://huggingface.co/settings/tokens
+
+### Example Workflow
+```bash
+# Run the complete example
+python example_usage.py
+
+# Or step by step:
+python train_llm.py                    # Train model (saves checkpoints)
+python upload_to_hf.py --list          # See available checkpoints  
+python upload_to_hf.py --repo-name username/model  # Upload to HF
+```
+
 ## 💡 Pro Tips
 
 - **Resume training**: The script automatically detects checkpoints
 - **Monitor GPU usage**: Use `nvidia-smi` to check memory usage
 - **Save compute**: Use smaller models for experimentation
 - **Better results**: More training steps = better model (usually)
+- **Checkpoint frequency**: Adjust `save_every` in ModelConfig for different intervals
+- **Share early**: Upload intermediate checkpoints to track training progress
 
 Happy training! 🚀
