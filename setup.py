@@ -6,17 +6,17 @@ import os
 import subprocess
 import sys
 
-def install_requirements():
-    """Install required packages"""
-    print("📦 Installing requirements...")
-    try:
-        subprocess.run([sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt'], 
-                      check=True)
-        print("✅ Requirements installed successfully")
-        return True
-    except subprocess.CalledProcessError:
-        print("❌ Failed to install requirements")
-        return False
+# def install_requirements():
+#     """Install required packages"""
+#     print("📦 Installing requirements...")
+#     try:
+#         subprocess.run([sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt'], 
+#                       check=True)
+#         print("✅ Requirements installed successfully")
+#         return True
+#     except subprocess.CalledProcessError:
+#         print("❌ Failed to install requirements")
+#         return False
 
 def setup_env_file():
     """Create .env file from template if it doesn't exist"""
@@ -34,9 +34,9 @@ def main():
     print("🫐 LLM Training Project Setup")
     print("=" * 30)
     
-    # Install requirements
-    if not install_requirements():
-        return
+    # # Install requirements
+    # if not install_requirements():
+    #     return
     
     # Setup environment file
     setup_env_file()

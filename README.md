@@ -4,6 +4,12 @@ A minimal toolkit for training and using small language models with the Muon opt
 
 ## 🚀 Quick Start
 
+### Option 1: Google Colab (No Setup Required)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1m9wXIkMlSVW3whSHZiOywMdUClj0amnZ?usp=sharing)
+
+Click the badge above to run everything in your browser with free GPU access!
+
+### Option 2: Local Setup
 ```bash
 # Clone and setup
 git clone https://github.com/vukrosic/build-and-release-your-own-llm
