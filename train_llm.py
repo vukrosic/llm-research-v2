@@ -10,19 +10,12 @@ from datasets import load_dataset
 from tqdm import tqdm
 import time
 from transformers import AutoTokenizer
-from huggingface_hub import HfApi, create_repo, upload_folder
 from dataclasses import dataclass
 from typing import List, Optional
 import warnings
 import os
 import pickle
-import json
-import glob
-from dotenv import load_dotenv
 warnings.filterwarnings('ignore')
-
-# Load environment variables
-load_dotenv()
 
 def set_seed(seed: int = 42):
     """Set all random seeds for reproducibility"""
@@ -42,7 +35,7 @@ class ModelConfig:
     n_layers: int = 6
     d_ff: int = 1536
     batch_size: int = 24
-    max_steps: int = 30000  # Continue training to 30k steps
+    max_steps: int = 5000
 
     # Training parameters
     gradient_accumulation_steps: int = 4
@@ -65,16 +58,6 @@ class ModelConfig:
     # Technical
     use_amp: bool = True
     vocab_size: Optional[int] = None
-
-    # Hugging Face Hub settings
-    hf_repo_name: Optional[str] = None  # Set this to your repo name
-    hf_token: Optional[str] = None  # Set this to your HF token
-    save_every: int = 1000  # Save checkpoint every N steps
-    push_to_hub: bool = False  # Enable to push to HF Hub
-    
-    # Early stopping and resume
-    early_stopping_patience: int = 3  # Stop if no improvement for N evaluations
-    resume_from_checkpoint: Optional[str] = None  # Path to checkpoint to resume from
 
     def __post_init__(self):
         self.d_k = self.d_model // self.n_heads
@@ -149,12 +132,12 @@ def load_and_cache_data(config: ModelConfig, cache_dir: str = "data_cache"):
     print(f"🔄 Processing new data (will cache for future use)")
 
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM-135M")
+    tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM-135M", token=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     # Load dataset
-    dataset = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", split="train", streaming=True)
+    dataset = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", split="train", streaming=True, token=False)
 
     texts = []
     for i, item in enumerate(dataset):
@@ -342,126 +325,6 @@ def evaluate_model(model: nn.Module, val_loader: DataLoader, config: ModelConfig
     model.train()
     return {'val_loss': avg_loss, 'val_accuracy': accuracy, 'val_perplexity': perplexity}
 
-def load_checkpoint(checkpoint_path: str, model: nn.Module, optimizers: list, schedulers: list):
-    """Load model checkpoint and return the step number"""
-    if not os.path.exists(checkpoint_path):
-        print(f"❌ Checkpoint not found: {checkpoint_path}")
-        return 0
-    
-    print(f"📂 Loading checkpoint from {checkpoint_path}")
-    
-    # Load model state
-    model_path = os.path.join(checkpoint_path, "pytorch_model.bin")
-    if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location='cpu'))
-        print("✅ Model state loaded")
-    
-    # Load optimizer states
-    for i, optimizer in enumerate(optimizers):
-        opt_path = os.path.join(checkpoint_path, f"optimizer_{i}.bin")
-        if os.path.exists(opt_path):
-            optimizer.load_state_dict(torch.load(opt_path, map_location='cpu'))
-            print(f"✅ Optimizer {i} state loaded")
-    
-    # Load scheduler states
-    for i, scheduler in enumerate(schedulers):
-        sched_path = os.path.join(checkpoint_path, f"scheduler_{i}.bin")
-        if os.path.exists(sched_path):
-            scheduler.load_state_dict(torch.load(sched_path, map_location='cpu'))
-            print(f"✅ Scheduler {i} state loaded")
-    
-    # Load training info to get step number
-    training_info_path = os.path.join(checkpoint_path, "training_args.json")
-    if os.path.exists(training_info_path):
-        with open(training_info_path, 'r') as f:
-            training_info = json.load(f)
-        step = training_info.get('step', 0)
-        print(f"✅ Resuming from step {step}")
-        return step
-    
-    return 0
-
-def save_checkpoint(model: nn.Module, optimizers: list, schedulers: list, step: int, 
-                   config: ModelConfig, metrics: dict, checkpoint_dir: str = "checkpoints"):
-    """Save model checkpoint locally"""
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint-{step}")
-    os.makedirs(checkpoint_path, exist_ok=True)
-    
-    # Save model state
-    torch.save(model.state_dict(), os.path.join(checkpoint_path, "pytorch_model.bin"))
-    
-    # Save optimizer states
-    for i, optimizer in enumerate(optimizers):
-        torch.save(optimizer.state_dict(), os.path.join(checkpoint_path, f"optimizer_{i}.bin"))
-    
-    # Save scheduler states
-    for i, scheduler in enumerate(schedulers):
-        torch.save(scheduler.state_dict(), os.path.join(checkpoint_path, f"scheduler_{i}.bin"))
-    
-    # Save config and metrics
-    config_dict = {
-        'd_model': config.d_model,
-        'n_heads': config.n_heads,
-        'n_layers': config.n_layers,
-        'd_ff': config.d_ff,
-        'max_seq_len': config.max_seq_len,
-        'vocab_size': config.vocab_size,
-        'dropout': config.dropout
-    }
-    
-    with open(os.path.join(checkpoint_path, "config.json"), 'w') as f:
-        json.dump(config_dict, f, indent=2)
-    
-    # Save training info
-    training_info = {
-        'step': step,
-        'metrics': metrics,
-        'total_steps': config.max_steps
-    }
-    
-    with open(os.path.join(checkpoint_path, "training_args.json"), 'w') as f:
-        json.dump(training_info, f, indent=2)
-    
-    print(f"💾 Checkpoint saved to {checkpoint_path}")
-    return checkpoint_path
-
-def upload_to_huggingface(checkpoint_path: str, repo_name: str, step: int, token: str = None):
-    """Upload checkpoint to Hugging Face Hub"""
-    if not repo_name:
-        print("❌ Cannot upload: No repository name provided")
-        return
-    
-    if not token:
-        print("❌ Cannot upload: No Hugging Face token provided")
-        return
-    
-    try:
-        api = HfApi(token=token)
-        
-        # Create repo if it doesn't exist
-        try:
-            create_repo(repo_name, exist_ok=True, token=token)
-            print(f"📤 Created/verified repo: {repo_name}")
-        except Exception as e:
-            print(f"⚠️ Repo creation warning: {e}")
-        
-        # Upload the checkpoint folder
-        api.upload_folder(
-            folder_path=checkpoint_path,
-            repo_id=repo_name,
-            path_in_repo=f"checkpoint-{step}",
-            commit_message=f"Upload checkpoint at step {step}",
-            token=token
-        )
-        
-        print(f"🚀 Uploaded checkpoint-{step} to https://huggingface.co/{repo_name}")
-        
-    except Exception as e:
-        print(f"❌ Failed to upload to Hugging Face: {e}")
-        print("Make sure your HF token has write permissions and the repo name is correct")
-
 def setup_muon_optimizer(model: nn.Module, config: ModelConfig):
     """Setup Muon optimizer with hybrid approach"""
     muon_params = []
@@ -516,22 +379,15 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
 
     scaler = GradScaler() if config.use_amp else None
 
-    # Resume from checkpoint if specified
-    start_step = 0
-    if config.resume_from_checkpoint:
-        start_step = load_checkpoint(config.resume_from_checkpoint, model, optimizers, schedulers)
-    
     # Training loop
     model.train()
-    step = start_step
+    step = 0
     start_time = time.time()
     best_val_loss = float('inf')
-    patience_counter = 0  # For early stopping
-    early_stopped = False  # Flag for early stopping
 
-    pbar = tqdm(total=config.max_steps, desc="Training", initial=start_step)
+    pbar = tqdm(total=config.max_steps, desc="Training")
 
-    while step < config.max_steps and not early_stopped:
+    while step < config.max_steps:
         for batch_idx, (x, y) in enumerate(train_loader):
             if step >= config.max_steps:
                 break
@@ -572,14 +428,14 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
                     for scheduler in schedulers:
                         scheduler.step()
 
-            # Logging and metrics tracking
-            with torch.no_grad():
-                predictions = logits.argmax(dim=-1)
-                accuracy = (predictions == y).float().mean().item()
-                current_loss = loss.item() * config.gradient_accumulation_steps
-                perplexity = math.exp(min(current_loss, 20))
-
+            # Logging
             if step % 100 == 0:
+                with torch.no_grad():
+                    predictions = logits.argmax(dim=-1)
+                    accuracy = (predictions == y).float().mean().item()
+                    current_loss = loss.item() * config.gradient_accumulation_steps
+                    perplexity = math.exp(min(current_loss, 20))
+
                 pbar.set_postfix({
                     'loss': f'{current_loss:.4f}',
                     'acc': f'{accuracy:.3f}',
@@ -596,61 +452,6 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
 
                 if eval_metrics['val_loss'] < best_val_loss:
                     best_val_loss = eval_metrics['val_loss']
-                    patience_counter = 0  # Reset patience counter
-                    print(f"🎯 New best validation loss: {best_val_loss:.4f}")
-                else:
-                    patience_counter += 1
-                    print(f"⏳ No improvement for {patience_counter}/{config.early_stopping_patience} evaluations")
-                    
-                    # Early stopping check
-                    if patience_counter >= config.early_stopping_patience:
-                        print(f"🛑 Early stopping triggered! No improvement for {config.early_stopping_patience} evaluations")
-                        print(f"   Best validation loss: {best_val_loss:.4f}")
-                        
-                        # Save final checkpoint before stopping
-                        current_metrics = {
-                            'train_loss': current_loss if 'current_loss' in locals() else 0.0,
-                            'train_accuracy': accuracy if 'accuracy' in locals() else 0.0,
-                            'train_perplexity': perplexity if 'perplexity' in locals() else 0.0,
-                            'learning_rate': optimizers[0].param_groups[0]["lr"]
-                        }
-                        
-                        checkpoint_path = save_checkpoint(
-                            model, optimizers, schedulers, step, config, current_metrics
-                        )
-                        
-                        if config.push_to_hub and config.hf_repo_name and config.hf_token:
-                            upload_to_huggingface(checkpoint_path, config.hf_repo_name, step, config.hf_token)
-                        elif config.push_to_hub and (not config.hf_repo_name or not config.hf_token):
-                            print("⚠️ Hugging Face upload requested but missing repo name or token. Skipping upload.")
-                        
-                        early_stopped = True
-                        break  # Exit inner training loop
-
-            # Save checkpoint and upload to Hugging Face (end only)
-            should_save = (step == config.max_steps - 1)
-            
-            if should_save:
-                current_metrics = {
-                    'train_loss': current_loss if 'current_loss' in locals() else 0.0,
-                    'train_accuracy': accuracy if 'accuracy' in locals() else 0.0,
-                    'train_perplexity': perplexity if 'perplexity' in locals() else 0.0,
-                    'learning_rate': optimizers[0].param_groups[0]["lr"]
-                }
-                
-                checkpoint_name = "final"
-                print(f"\n💾 Saving {checkpoint_name} checkpoint at step {step}")
-                
-                # Save checkpoint locally
-                checkpoint_path = save_checkpoint(
-                    model, optimizers, schedulers, step, config, current_metrics
-                )
-                
-                # Upload to Hugging Face if enabled and configured
-                if config.push_to_hub and config.hf_repo_name and config.hf_token:
-                    upload_to_huggingface(checkpoint_path, config.hf_repo_name, step, config.hf_token)
-                elif config.push_to_hub and (not config.hf_repo_name or not config.hf_token):
-                    print("⚠️ Hugging Face upload requested but missing repo name or token. Skipping upload.")
 
             step += 1
             if step % 100 == 0:
@@ -680,41 +481,10 @@ if __name__ == "__main__":
 
     # Create config for Small model
     config = ModelConfig()
-    
-    # Configure Hugging Face settings from environment
-    config.hf_repo_name = os.getenv('HF_REPO_NAME')
-    config.hf_token = os.getenv('HF_TOKEN')
-    config.push_to_hub = os.getenv('PUSH_TO_HUB', 'false').lower() == 'true'
-    config.save_every = int(os.getenv('SAVE_EVERY', '1000'))
-    
-    # Check for existing checkpoints and offer to resume
-    checkpoints = glob.glob("checkpoints/checkpoint-*")
-    if checkpoints:
-        # Sort by step number and get the latest
-        checkpoints.sort(key=lambda x: int(x.split('-')[-1]))
-        latest_checkpoint = checkpoints[-1]
-        step_num = latest_checkpoint.split('-')[-1]
-        
-        resume_choice = input(f"Found checkpoint at step {step_num}. Resume training? (y/n): ").strip().lower()
-        if resume_choice == 'y':
-            config.resume_from_checkpoint = latest_checkpoint
-            print(f"🔄 Will resume from {latest_checkpoint}")
-        else:
-            print("🆕 Starting fresh training")
-    else:
-        print("🆕 No checkpoint found, starting fresh training")
-    
     print(f"\n📋 Model Configuration:")
     print(f"   Architecture: {config.d_model}d, {config.n_layers}L, {config.n_heads}H, {config.d_ff}ff")
     print(f"   Training: {config.max_steps} steps, batch size {config.batch_size}")
     print(f"   Data: {config.max_tokens:,} tokens, seq_len {config.max_seq_len}")
-    print(f"   Checkpoints: Save every {config.save_every} steps")
-    if config.push_to_hub and config.hf_repo_name and config.hf_token:
-        print(f"   🤗 Hugging Face: Will upload to {config.hf_repo_name}")
-    elif config.push_to_hub:
-        print(f"   ⚠️ Hugging Face upload enabled but missing credentials - will train locally only")
-    else:
-        print(f"   💾 Local only: Configure .env file to upload to HF")
 
     # Load data
     texts, tokenizer, tokens = load_and_cache_data(config)
