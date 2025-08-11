@@ -2,6 +2,8 @@
 
 A minimal toolkit for training and using small language models with the Muon optimizer.
 
+YouTube video: https://youtu.be/Dw0b0Kc9Kpk
+
 ## 🚀 Quick Start
 
 ### Option 1: Google Colab (No Setup Required)
