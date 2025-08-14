@@ -1,8 +1,26 @@
+# =============================================================================
+# DISTRIBUTED TRAINING CONFIGURATION
+# =============================================================================
+# Adjust these variables for your multi-GPU setup
+NUM_GPUS = 2                    # Number of GPUs to use (change to 4, 8, etc.)
+MASTER_PORT = "12355"           # Port for distributed communication
+BACKEND = "nccl"                # Use "nccl" for NVIDIA GPUs, "gloo" for CPU
+GPU_IDS = [0, 1]                # Specific GPU IDs to use (e.g., [0,1,2,3] for 4 GPUs)
+
+# MODEL SCALING FOR MULTI-GPU
+# Adjust batch size and learning rate based on number of GPUs
+BASE_BATCH_SIZE = 24            # Base batch size per GPU
+BASE_LR = 0.01                  # Base learning rate
+SCALE_LR_WITH_GPUS = True       # Whether to scale LR with number of GPUs
+
+# =============================================================================
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
+import torch.distributed as dist
 import math
 import random
 import numpy as np
@@ -15,7 +33,6 @@ from typing import List, Optional
 import warnings
 import os
 import pickle
-import json
 warnings.filterwarnings('ignore')
 
 def set_seed(seed: int = 42):
@@ -26,7 +43,6 @@ def set_seed(seed: int = 42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    print(f"🌱 Set all seeds to {seed}")
 
 @dataclass
 class ModelConfig:
@@ -35,12 +51,12 @@ class ModelConfig:
     n_heads: int = 8
     n_layers: int = 6
     d_ff: int = 1536
-    batch_size: int = 24
+    batch_size: int = BASE_BATCH_SIZE  # per GPU batch size
     max_steps: int = 5000
 
     # Training parameters
     gradient_accumulation_steps: int = 4
-    muon_lr: float = 0.01
+    muon_lr: float = BASE_LR * (NUM_GPUS if SCALE_LR_WITH_GPUS else 1)
 
     # Data parameters
     max_seq_len: int = 512
@@ -50,10 +66,6 @@ class ModelConfig:
     # Evaluation
     eval_every: int = 500
     eval_steps: int = 100
-    
-    # Checkpointing
-    save_every: int = 5000
-    checkpoint_dir: str = "checkpoints"
 
     # Regularization
     weight_decay: float = 0.1
@@ -90,85 +102,202 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5) -> torch.Tensor
 
     return X
 
-class Muon(torch.optim.Optimizer):
-    """Muon - MomentUm Orthogonalized by Newton-schulz"""
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
-        super().__init__(params, defaults)
+class DistributedMuon(torch.optim.Optimizer):
+    """Distributed Muon optimizer"""
+    def __init__(self, params, lr=0.02, momentum=0.95):
+        defaults = dict(lr=lr, momentum=momentum)
+        params = list(params)
+        sizes = {p.shape for p in params}
+        param_groups = []
+        for size in sizes:
+            group_params = [p for p in params if p.shape == size]
+            param_groups.append(dict(params=group_params))
+        super().__init__(param_groups, defaults)
 
     @torch.no_grad()
     def step(self):
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        reduce_scatter_futures: list[torch.Future] = []
+        all_reduce_futures: list[torch.Future] = []
+        
         for group in self.param_groups:
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
+            params: list[torch.Tensor] = group["params"]
+            grad = torch.empty_like(params[-1])
+            grad_pad = [param.grad for param in params] + [torch.zeros_like(params[-1])] * world_size
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank < len(params):
+                    grad = params[base_i + rank].grad
+                reduce_scatter_futures.append(
+                    dist.reduce_scatter(grad, grad_pad[base_i:base_i + world_size], 
+                                       op=dist.ReduceOp.AVG, async_op=True).get_future()
+                )
 
-                g = p.grad
+        idx = 0
+        for group in self.param_groups:
+            params: list[torch.Tensor] = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * world_size
+            momentum = group["momentum"]
+            for base_i in range(0, len(params), world_size):
+                reduce_scatter_futures[idx].wait()
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    grad = p.grad
+                    eff_lr = group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum_buffer"] = torch.zeros_like(grad)
+                    momentum_buffer = state["momentum_buffer"]
+                    momentum_buffer.lerp_(grad, 1 - momentum)
+                    grad = grad.lerp_(momentum_buffer, momentum)
+                    v = zeropower_via_newtonschulz5(grad.bfloat16(), 5)
+                    p.add_(other=v, alpha=-eff_lr)
+                idx += 1
+                all_reduce_futures.append(
+                    dist.all_gather(params_pad[base_i:base_i + world_size], 
+                                   params_pad[base_i + rank], async_op=True).get_future()
+                )
+        torch.futures.collect_all(all_reduce_futures).wait()
+
+class DistAdam(torch.optim.Optimizer):
+    """Distributed AdamW optimizer"""
+    def __init__(self, params, lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), 
+                 eps: float = 1e-8, weight_decay: float = 0.01):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        params = list(params)
+        sizes = {p.shape for p in params}
+        param_groups = []
+        for size in sizes:
+            group_params = [p for p in params if p.shape == size]
+            param_groups.append(dict(params=group_params))
+        super().__init__(param_groups, defaults)
+
+    @torch.compile
+    @torch.no_grad()
+    def step(self):
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        reduce_scatter_futures: list[torch.Future] = []
+        all_reduce_futures: list[torch.Future] = []
+        grad_slices = []
+        
+        for group in self.param_groups:
+            params: list[torch.Tensor] = group["params"]
+            for base_i in range(len(params)):
+                grad = params[base_i].grad
+                rank_size = grad.shape[0] // world_size
+                grad_slice = torch.empty_like(grad[:rank_size])
+                reduce_scatter_futures.append(
+                    dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, 
+                                              async_op=True).get_future()
+                )
+                grad_slices.append(grad_slice)
+
+        idx = 0
+        for group in self.param_groups:
+            beta1, beta2 = group['betas']
+            eps = group['eps']
+            wd = group['weight_decay']
+            params = group['params']
+            for base in range(len(params)):
+                reduce_scatter_futures[idx].wait()
+                p = params[base]
+                rank_size = p.shape[0] // world_size
+                p_slice = p[rank * rank_size:(rank + 1) * rank_size]
+                lr = group['lr']
                 state = self.state[p]
+                g_slice = grad_slices[idx]
+                
+                if not state:
+                    state['step'] = torch.tensor(0, dtype=torch.int64, device=p.device)
+                    state['exp_avg'] = torch.zeros_like(p_slice)
+                    state['exp_avg_sq'] = torch.zeros_like(p_slice)
+                exp_avg = state['exp_avg']
+                exp_avg_sq = state['exp_avg_sq']
+                state['step'] += 1
+                t = state['step']
+                
+                if wd != 0:
+                    p_slice.mul_(1 - lr * wd)
+                
+                exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
+                
+                bias1 = 1 - beta1 ** t
+                bias2 = 1 - beta2 ** t
+                
+                denom = exp_avg_sq.sqrt().add_(eps)
+                step_size = lr * (torch.sqrt(bias2) / bias1)
+                update = exp_avg.div(denom).mul_(step_size)
+                p_slice.add_(other=update, alpha=-1.0)
+                idx += 1
+                all_reduce_futures.append(
+                    dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
+                )
+        torch.futures.collect_all(all_reduce_futures).wait()
 
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-
-                buf = state["momentum_buffer"]
-                buf.lerp_(g, 1 - group["momentum"])
-                g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
-                g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
-                p.add_(g.view_as(p), alpha=-group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5)
-	
-def load_and_cache_data(config: ModelConfig, cache_dir: str = "data_cache"):
+def load_and_cache_data(config: ModelConfig, cache_dir: str = "data_cache", rank: int = 0):
     """Load and cache tokenized data to avoid reprocessing"""
     os.makedirs(cache_dir, exist_ok=True)
     cache_file = f"{cache_dir}/tokenized_data_{config.num_documents}_{config.max_tokens}.pkl"
 
-    # Check if cached data exists
-    if os.path.exists(cache_file):
-        print(f"📦 Loading cached data from {cache_file}")
+    # Only rank 0 loads/saves cache
+    if rank == 0:
+        if os.path.exists(cache_file):
+            print(f"📦 Loading cached data from {cache_file}")
+            with open(cache_file, 'rb') as f:
+                cached_data = pickle.load(f)
+        else:
+            print(f"🔄 Processing new data (will cache for future use)")
+            
+            tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM-135M", token=False)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+
+            dataset = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", 
+                                  split="train", streaming=True, token=False)
+
+            texts = []
+            for i, item in enumerate(dataset):
+                if i >= config.num_documents:
+                    break
+                texts.append(item["text"][:3000])
+
+            print(f"Loaded {len(texts)} documents")
+            print("Tokenizing texts...")
+            
+            all_tokens = []
+            for text in tqdm(texts, desc="Tokenizing"):
+                tokens = tokenizer.encode(text, add_special_tokens=False)
+                all_tokens.extend(tokens)
+
+            tokens = all_tokens[:config.max_tokens]
+            print(f"Using {len(tokens):,} tokens")
+            
+            cached_data = {'texts': texts, 'tokenizer': tokenizer, 'tokens': tokens}
+            with open(cache_file, 'wb') as f:
+                pickle.dump(cached_data, f)
+            print(f"💾 Cached data to {cache_file}")
+    
+    # Synchronize and broadcast data
+    dist.barrier()
+    
+    if rank == 0:
         with open(cache_file, 'rb') as f:
             cached_data = pickle.load(f)
-
-        texts = cached_data['texts']
-        tokenizer = cached_data['tokenizer']
-        tokens = cached_data['tokens']
-        config.vocab_size = tokenizer.vocab_size
-
-        print(f"✅ Loaded {len(texts)} documents, {len(tokens):,} tokens from cache")
-        return texts, tokenizer, tokens
-
-    print(f"🔄 Processing new data (will cache for future use)")
-
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM-135M", token=False)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # Load dataset
-    dataset = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", split="train", streaming=True, token=False)
-
-    texts = []
-    for i, item in enumerate(dataset):
-        if i >= config.num_documents:
-            break
-        texts.append(item["text"][:3000])
-
-    print(f"Loaded {len(texts)} documents")
-
-    # Tokenize
-    print("Tokenizing texts...")
-    all_tokens = []
-    for text in tqdm(texts, desc="Tokenizing"):
-        tokens = tokenizer.encode(text, add_special_tokens=False)
-        all_tokens.extend(tokens)
-
-    tokens = all_tokens[:config.max_tokens]
-    print(f"Using {len(tokens):,} tokens")
+    else:
+        cached_data = None
+    
+    cached_data = dist.broadcast_object_list([cached_data])[0] if rank != 0 else cached_data
+    
+    texts = cached_data['texts']
+    tokenizer = cached_data['tokenizer']
+    tokens = cached_data['tokens']
     config.vocab_size = tokenizer.vocab_size
 
-    # Cache the processed data
-    cached_data = {'texts': texts, 'tokenizer': tokenizer, 'tokens': tokens}
-    with open(cache_file, 'wb') as f:
-        pickle.dump(cached_data, f)
-
-    print(f"💾 Cached data to {cache_file}")
+    if rank == 0:
+        print(f"✅ Loaded {len(texts)} documents, {len(tokens):,} tokens")
+    
     return texts, tokenizer, tokens
 
 class TextTokenDataset(Dataset):
@@ -299,7 +428,7 @@ class MinimalLLM(nn.Module):
         return logits
 
 def evaluate_model(model: nn.Module, val_loader: DataLoader, config: ModelConfig):
-    """Evaluate model performance"""
+    """Evaluate model performance with distributed reduction"""
     model.eval()
     total_loss = 0
     total_tokens = 0
@@ -323,15 +452,24 @@ def evaluate_model(model: nn.Module, val_loader: DataLoader, config: ModelConfig
             predictions = logits.argmax(dim=-1)
             total_correct += (predictions == y).sum().item()
 
-    avg_loss = total_loss / total_tokens
-    accuracy = total_correct / total_tokens
+    # Reduce across all GPUs
+    total_loss = torch.tensor(total_loss, device=device)
+    total_tokens = torch.tensor(total_tokens, device=device)
+    total_correct = torch.tensor(total_correct, device=device)
+    
+    dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+    dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
+    dist.all_reduce(total_correct, op=dist.ReduceOp.SUM)
+
+    avg_loss = total_loss.item() / total_tokens.item()
+    accuracy = total_correct.item() / total_tokens.item()
     perplexity = math.exp(min(avg_loss, 20))
 
     model.train()
     return {'val_loss': avg_loss, 'val_accuracy': accuracy, 'val_perplexity': perplexity}
 
-def setup_muon_optimizer(model: nn.Module, config: ModelConfig):
-    """Setup Muon optimizer with hybrid approach"""
+def setup_distributed_optimizers(model: nn.Module, config: ModelConfig):
+    """Setup distributed Muon and DistAdam optimizers"""
     muon_params = []
     adamw_params = []
 
@@ -344,67 +482,65 @@ def setup_muon_optimizer(model: nn.Module, config: ModelConfig):
         else:
             adamw_params.append(param)
 
-    print(f"  Muon parameters: {sum(p.numel() for p in muon_params):,}")
-    print(f"  AdamW parameters: {sum(p.numel() for p in adamw_params):,}")
+    rank = dist.get_rank()
+    if rank == 0:
+        print(f"  Muon parameters: {sum(p.numel() for p in muon_params):,}")
+        print(f"  DistAdam parameters: {sum(p.numel() for p in adamw_params):,}")
 
-    muon_optimizer = Muon(muon_params, lr=config.muon_lr, momentum=0.95)
-    adamw_optimizer = torch.optim.AdamW(adamw_params, lr=config.muon_lr*0.1, weight_decay=config.weight_decay)
+    muon_optimizer = DistributedMuon(muon_params, lr=config.muon_lr, momentum=0.95)
+    adamw_optimizer = DistAdam(adamw_params, lr=config.muon_lr*0.1, weight_decay=config.weight_decay)
 
     return [muon_optimizer, adamw_optimizer]
 
-def save_checkpoint(model: nn.Module, optimizers: list, schedulers: list, step: int, 
-                   config: ModelConfig, tokenizer, loss: float, checkpoint_dir: str):
-    """Save model checkpoint"""
-    os.makedirs(checkpoint_dir, exist_ok=True)
+class DistributedSampler:
+    """Simple distributed sampler"""
+    def __init__(self, dataset, rank, world_size, shuffle=True):
+        self.dataset = dataset
+        self.rank = rank
+        self.world_size = world_size
+        self.shuffle = shuffle
+        self.epoch = 0
+        
+    def __iter__(self):
+        indices = list(range(len(self.dataset)))
+        if self.shuffle:
+            random.Random(self.epoch).shuffle(indices)
+        
+        # Distribute indices across ranks
+        indices = indices[self.rank::self.world_size]
+        return iter(indices)
     
-    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{step}")
-    os.makedirs(checkpoint_path, exist_ok=True)
+    def __len__(self):
+        return len(self.dataset) // self.world_size
     
-    # Save model state
-    torch.save({
-        'step': step,
-        'model_state_dict': model.state_dict(),
-        'optimizer_states': [opt.state_dict() for opt in optimizers],
-        'scheduler_states': [sched.state_dict() for sched in schedulers],
-        'loss': loss,
-        'config': config
-    }, os.path.join(checkpoint_path, 'model.pt'))
-    
-    # Save tokenizer
-    tokenizer.save_pretrained(checkpoint_path)
-    
-    # Save config as JSON for easy reading
-    config_dict = {
-        'd_model': config.d_model,
-        'n_heads': config.n_heads,
-        'n_layers': config.n_layers,
-        'd_ff': config.d_ff,
-        'vocab_size': config.vocab_size,
-        'max_seq_len': config.max_seq_len,
-        'dropout': config.dropout
-    }
-    
-    with open(os.path.join(checkpoint_path, 'config.json'), 'w') as f:
-        json.dump(config_dict, f, indent=2)
-    
-    print(f"💾 Checkpoint saved at step {step} to {checkpoint_path}")
-    return checkpoint_path
+    def set_epoch(self, epoch):
+        self.epoch = epoch
 
-def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataLoader, tokenizer):
-    """Train the model with Muon optimizer"""
-    print(f"\n🚀 Training Small model with Muon optimizer")
+def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataLoader):
+    """Train the model with distributed optimizers"""
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    
+    if rank == 0:
+        print(f"\n🚀 Training Small model with Distributed Muon optimizer")
+        print(f"  🌐 World size: {world_size} GPUs")
 
     # Initialize model
-    set_seed(42)
+    set_seed(42 + rank)  # Different seed per rank
     model = MinimalLLM(config)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda', rank)
     model = model.to(device)
 
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"  📊 Total parameters: {total_params:,}")
+    # Synchronize model parameters across all ranks
+    for param in model.parameters():
+        dist.broadcast(param.detach(), 0)
 
-    # Setup optimizers
-    optimizers = setup_muon_optimizer(model, config)
+    total_params = sum(p.numel() for p in model.parameters())
+    if rank == 0:
+        print(f"  📊 Total parameters: {total_params:,}")
+
+    # Setup distributed optimizers
+    optimizers = setup_distributed_optimizers(model, config)
 
     # Learning rate schedule
     schedulers = []
@@ -428,7 +564,7 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
     start_time = time.time()
     best_val_loss = float('inf')
 
-    pbar = tqdm(total=config.max_steps, desc="Training")
+    pbar = tqdm(total=config.max_steps, desc="Training") if rank == 0 else None
 
     while step < config.max_steps:
         for batch_idx, (x, y) in enumerate(train_loader):
@@ -471,8 +607,8 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
                     for scheduler in schedulers:
                         scheduler.step()
 
-            # Logging
-            if step % 100 == 0:
+            # Logging (only rank 0)
+            if step % 100 == 0 and rank == 0:
                 with torch.no_grad():
                     predictions = logits.argmax(dim=-1)
                     accuracy = (predictions == y).float().mean().item()
@@ -489,80 +625,145 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
             # Evaluation
             if step % config.eval_every == 0 and step > 0:
                 eval_metrics = evaluate_model(model, val_loader, config)
-                print(f"\nStep {step}: Val Loss: {eval_metrics['val_loss']:.4f}, "
-                      f"Val Acc: {eval_metrics['val_accuracy']:.4f}, "
-                      f"Val PPL: {eval_metrics['val_perplexity']:.2f}")
+                if rank == 0:
+                    print(f"\nStep {step}: Val Loss: {eval_metrics['val_loss']:.4f}, "
+                          f"Val Acc: {eval_metrics['val_accuracy']:.4f}, "
+                          f"Val PPL: {eval_metrics['val_perplexity']:.2f}")
 
                 if eval_metrics['val_loss'] < best_val_loss:
                     best_val_loss = eval_metrics['val_loss']
-            
-            # Save checkpoint
-            if step % config.save_every == 0 and step > 0:
-                current_loss = loss.item() * config.gradient_accumulation_steps
-                save_checkpoint(model, optimizers, schedulers, step, config, 
-                              tokenizer, current_loss, config.checkpoint_dir)
 
             step += 1
-            if step % 100 == 0:
+            if step % 100 == 0 and rank == 0:
                 pbar.update(100)
 
-    pbar.close()
+    if rank == 0:
+        pbar.close()
 
     training_time = time.time() - start_time
-    print(f"  ⏱️ Training completed in {training_time:.1f} seconds")
+    if rank == 0:
+        print(f"  ⏱️ Training completed in {training_time:.1f} seconds")
 
     # Final evaluation
     final_eval = evaluate_model(model, val_loader, config)
-    print(f"  📊 Final - Loss: {final_eval['val_loss']:.4f}, "
-          f"Acc: {final_eval['val_accuracy']:.4f}, PPL: {final_eval['val_perplexity']:.2f}")
+    if rank == 0:
+        print(f"  📊 Final - Loss: {final_eval['val_loss']:.4f}, "
+              f"Acc: {final_eval['val_accuracy']:.4f}, PPL: {final_eval['val_perplexity']:.2f}")
 
     return model, final_eval
 
-if __name__ == "__main__":
+def setup_distributed():
+    """Setup distributed training environment"""
+    # Get distributed training parameters from environment
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", NUM_GPUS))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    
+    # Validate GPU availability
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available!")
+    
+    available_gpus = torch.cuda.device_count()
+    if world_size > available_gpus:
+        raise RuntimeError(f"Requested {world_size} GPUs but only {available_gpus} available!")
+    
+    # Set the specific GPU for this process
+    if local_rank < len(GPU_IDS):
+        gpu_id = GPU_IDS[local_rank]
+    else:
+        gpu_id = local_rank
+    
+    torch.cuda.set_device(gpu_id)
+    device = torch.device("cuda", gpu_id)
+    
+    # Initialize process group
+    dist.init_process_group(backend=BACKEND)
+    dist.barrier()
+    
+    if rank == 0:
+        print(f"🔧 Distributed setup: {world_size} GPUs, backend={BACKEND}")
+        print(f"🎯 Using GPUs: {GPU_IDS[:world_size]}")
+    
+    return rank, world_size, local_rank, device
+
+def main():
+    rank, world_size, local_rank, device = setup_distributed()
+    
+    master_process = (rank == 0)
+    
     # Check system
-    print(f"🔍 Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
-    if torch.cuda.is_available():
+    if master_process:
+        print(f"🔍 Device: CUDA")
         print(f"GPU: {torch.cuda.get_device_name()}")
         print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        print(f"World size: {world_size} GPUs")
 
     # Set seed
     set_seed(42)
 
     # Create config for Small model
     config = ModelConfig()
-    print(f"\n📋 Model Configuration:")
-    print(f"   Architecture: {config.d_model}d, {config.n_layers}L, {config.n_heads}H, {config.d_ff}ff")
-    print(f"   Training: {config.max_steps} steps, batch size {config.batch_size}")
-    print(f"   Data: {config.max_tokens:,} tokens, seq_len {config.max_seq_len}")
+    if master_process:
+        print(f"\n📋 Model Configuration:")
+        print(f"   Architecture: {config.d_model}d, {config.n_layers}L, {config.n_heads}H, {config.d_ff}ff")
+        print(f"   Training: {config.max_steps} steps, batch size {config.batch_size} per GPU")
+        print(f"   Data: {config.max_tokens:,} tokens, seq_len {config.max_seq_len}")
 
     # Load data
-    texts, tokenizer, tokens = load_and_cache_data(config)
+    texts, tokenizer, tokens = load_and_cache_data(config, rank=rank)
     dataset = TextTokenDataset(tokens, config.max_seq_len)
 
     # Train/val split
     val_size = len(dataset) // 10
     train_size = len(dataset) - val_size
+    
+    # Use generator with same seed across all ranks for consistent split
+    generator = torch.Generator().manual_seed(42)
     train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)
+        dataset, [train_size, val_size], generator=generator
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=2)
+    # Create distributed samplers
+    train_sampler = DistributedSampler(train_dataset, rank, world_size, shuffle=True)
+    val_sampler = DistributedSampler(val_dataset, rank, world_size, shuffle=False)
 
-    print(f"📊 Dataset: {len(train_dataset)} train, {len(val_dataset)} val samples")
+    # Create data loaders with samplers
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=config.batch_size,
+        sampler=train_sampler,
+        num_workers=2,
+        pin_memory=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.batch_size,
+        sampler=val_sampler,
+        num_workers=2,
+        pin_memory=True
+    )
+
+    if master_process:
+        print(f"📊 Dataset: {len(train_dataset)} train, {len(val_dataset)} val samples")
+        print(f"📊 Per GPU: {len(train_sampler)} train, {len(val_sampler)} val samples")
 
     # Train model
     start_time = time.time()
-    model, final_metrics = train_model(config, train_loader, val_loader, tokenizer)
+    model, final_metrics = train_model(config, train_loader, val_loader)
     total_time = time.time() - start_time
-    
-    # Save final checkpoint
-    final_checkpoint = save_checkpoint(model, [], [], config.max_steps, config, 
-                                     tokenizer, final_metrics['val_loss'], config.checkpoint_dir)
 
-    print(f"\n🎉 TRAINING COMPLETED!")
-    print(f"⏱️ Total time: {total_time/60:.1f} minutes")
-    print(f"🏆 Final Results:")
-    print(f"   Validation Loss: {final_metrics['val_loss']:.4f}")
-    print(f"   Validation Accuracy: {final_metrics['val_accuracy']:.4f}")
-    print(f"   Validation Perplexity: {final_metrics['val_perplexity']:.2f}")
+    if master_process:
+        print(f"\n🎉 TRAINING COMPLETED!")
+        print(f"⏱️ Total time: {total_time/60:.1f} minutes")
+        print(f"🏆 Final Results:")
+        print(f"   Validation Loss: {final_metrics['val_loss']:.4f}")
+        print(f"   Validation Accuracy: {final_metrics['val_accuracy']:.4f}")
+        print(f"   Validation Perplexity: {final_metrics['val_perplexity']:.2f}")
+
+    # Cleanup
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()
