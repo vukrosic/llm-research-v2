@@ -1,5 +1,5 @@
 # =============================================================================
-# DISTRIBUTED TRAINING CONFIGURATION
+# DISTRIBUTED TRAINING CONFIGURATION - OPTIMIZED FOR 2x RTX 4090
 # =============================================================================
 # Adjust these variables for your multi-GPU setup
 NUM_GPUS = 2                    # Number of GPUs to use (change to 4, 8, etc.)
@@ -7,10 +7,10 @@ MASTER_PORT = "12355"           # Port for distributed communication
 BACKEND = "nccl"                # Use "nccl" for NVIDIA GPUs, "gloo" for CPU
 GPU_IDS = [0, 1]                # Specific GPU IDs to use (e.g., [0,1,2,3] for 4 GPUs)
 
-# MODEL SCALING FOR MULTI-GPU
+# MODEL SCALING FOR MULTI-GPU - OPTIMIZED FOR RTX 4090 (24GB VRAM each)
 # Adjust batch size and learning rate based on number of GPUs
-BASE_BATCH_SIZE = 24            # Base batch size per GPU
-BASE_LR = 0.01                  # Base learning rate
+BASE_BATCH_SIZE = 32            # Larger batch size for 4090s (24GB VRAM)
+BASE_LR = 0.02                  # Higher base learning rate for larger batches
 SCALE_LR_WITH_GPUS = True       # Whether to scale LR with number of GPUs
 
 # =============================================================================
@@ -46,22 +46,22 @@ def set_seed(seed: int = 42):
 
 @dataclass
 class ModelConfig:
-    # Model architecture
-    d_model: int = 384
+    # Model architecture - SCALED UP FOR 4090s
+    d_model: int = 512              # Larger model for 4090s
     n_heads: int = 8
-    n_layers: int = 6
-    d_ff: int = 1536
+    n_layers: int = 8               # More layers
+    d_ff: int = 2048                # Larger feed-forward
     batch_size: int = BASE_BATCH_SIZE  # per GPU batch size
-    max_steps: int = 5000
+    max_steps: int = 10000          # More training steps
 
     # Training parameters
-    gradient_accumulation_steps: int = 4
+    gradient_accumulation_steps: int = 2  # Less accumulation with larger batches
     muon_lr: float = BASE_LR * (NUM_GPUS if SCALE_LR_WITH_GPUS else 1)
 
-    # Data parameters
-    max_seq_len: int = 512
-    num_documents: int = 2000
-    max_tokens: int = 500000
+    # Data parameters - MORE DATA FOR BETTER TRAINING
+    max_seq_len: int = 1024         # Longer sequences for 4090s
+    num_documents: int = 5000       # More documents
+    max_tokens: int = 2000000       # More tokens (2M)
 
     # Evaluation
     eval_every: int = 500
@@ -73,7 +73,7 @@ class ModelConfig:
     grad_clip: float = 1.0
 
     # Technical
-    use_amp: bool = True
+    use_amp: bool = True            # Mixed precision for efficiency
     vocab_size: Optional[int] = None
 
     def __post_init__(self):
@@ -241,54 +241,53 @@ def load_and_cache_data(config: ModelConfig, cache_dir: str = "data_cache", rank
     os.makedirs(cache_dir, exist_ok=True)
     cache_file = f"{cache_dir}/tokenized_data_{config.num_documents}_{config.max_tokens}.pkl"
 
-    # Only rank 0 loads/saves cache
-    if rank == 0:
-        if os.path.exists(cache_file):
+    # Simplified approach: all ranks load data independently to avoid broadcast issues
+    if os.path.exists(cache_file):
+        if rank == 0:
             print(f"📦 Loading cached data from {cache_file}")
-            with open(cache_file, 'rb') as f:
-                cached_data = pickle.load(f)
-        else:
+        with open(cache_file, 'rb') as f:
+            cached_data = pickle.load(f)
+    else:
+        if rank == 0:
             print(f"🔄 Processing new data (will cache for future use)")
             
-            tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM-135M", token=False)
-            if tokenizer.pad_token is None:
-                tokenizer.pad_token = tokenizer.eos_token
+        tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM-135M", token=False)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
-            dataset = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", 
-                                  split="train", streaming=True, token=False)
+        dataset = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", 
+                              split="train", streaming=True, token=False)
 
-            texts = []
-            for i, item in enumerate(dataset):
-                if i >= config.num_documents:
-                    break
-                texts.append(item["text"][:3000])
+        texts = []
+        for i, item in enumerate(dataset):
+            if i >= config.num_documents:
+                break
+            texts.append(item["text"][:3000])
 
+        if rank == 0:
             print(f"Loaded {len(texts)} documents")
             print("Tokenizing texts...")
-            
-            all_tokens = []
-            for text in tqdm(texts, desc="Tokenizing"):
-                tokens = tokenizer.encode(text, add_special_tokens=False)
-                all_tokens.extend(tokens)
+        
+        all_tokens = []
+        for text in (tqdm(texts, desc="Tokenizing") if rank == 0 else texts):
+            tokens = tokenizer.encode(text, add_special_tokens=False)
+            all_tokens.extend(tokens)
 
-            tokens = all_tokens[:config.max_tokens]
+        tokens = all_tokens[:config.max_tokens]
+        if rank == 0:
             print(f"Using {len(tokens):,} tokens")
-            
-            cached_data = {'texts': texts, 'tokenizer': tokenizer, 'tokens': tokens}
+        
+        cached_data = {'texts': texts, 'tokenizer': tokenizer, 'tokens': tokens}
+        
+        # Only rank 0 saves cache
+        if rank == 0:
             with open(cache_file, 'wb') as f:
                 pickle.dump(cached_data, f)
             print(f"💾 Cached data to {cache_file}")
     
-    # Synchronize and broadcast data
-    dist.barrier()
-    
-    if rank == 0:
-        with open(cache_file, 'rb') as f:
-            cached_data = pickle.load(f)
-    else:
-        cached_data = None
-    
-    cached_data = dist.broadcast_object_list([cached_data])[0] if rank != 0 else cached_data
+    # Simple barrier to ensure all ranks are ready
+    if dist.is_initialized():
+        dist.barrier()
     
     texts = cached_data['texts']
     tokenizer = cached_data['tokenizer']
@@ -659,13 +658,16 @@ def setup_distributed():
     world_size = int(os.environ.get("WORLD_SIZE", NUM_GPUS))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     
+    print(f"🔧 Rank {rank}: Setting up distributed training...")
+    
     # Validate GPU availability
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available!")
     
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
-        raise RuntimeError(f"Requested {world_size} GPUs but only {available_gpus} available!")
+        print(f"⚠️ Requested {world_size} GPUs but only {available_gpus} available!")
+        world_size = available_gpus
     
     # Set the specific GPU for this process
     if local_rank < len(GPU_IDS):
@@ -676,12 +678,29 @@ def setup_distributed():
     torch.cuda.set_device(gpu_id)
     device = torch.device("cuda", gpu_id)
     
-    # Initialize process group
-    dist.init_process_group(backend=BACKEND)
-    dist.barrier()
+    print(f"🔧 Rank {rank}: Using GPU {gpu_id}")
+    
+    # Initialize process group with timeout
+    try:
+        import datetime
+        timeout = datetime.timedelta(seconds=30)  # 30 second timeout
+        dist.init_process_group(backend=BACKEND, timeout=timeout)
+        print(f"🔧 Rank {rank}: Process group initialized")
+        
+        # Test barrier
+        dist.barrier()
+        print(f"🔧 Rank {rank}: Barrier test passed")
+        
+    except Exception as e:
+        print(f"❌ Rank {rank}: Distributed setup failed: {e}")
+        print(f"🔄 Rank {rank}: Falling back to single GPU mode")
+        # Fallback to single GPU
+        world_size = 1
+        rank = 0
+        local_rank = 0
     
     if rank == 0:
-        print(f"🔧 Distributed setup: {world_size} GPUs, backend={BACKEND}")
+        print(f"🔧 Distributed setup complete: {world_size} GPUs, backend={BACKEND}")
         print(f"🎯 Using GPUs: {GPU_IDS[:world_size]}")
     
     return rank, world_size, local_rank, device
@@ -710,8 +729,16 @@ def main():
         print(f"   Data: {config.max_tokens:,} tokens, seq_len {config.max_seq_len}")
 
     # Load data
+    if master_process:
+        print(f"🔄 Loading data on rank {rank}...")
     texts, tokenizer, tokens = load_and_cache_data(config, rank=rank)
+    
+    if master_process:
+        print(f"🔄 Creating dataset...")
     dataset = TextTokenDataset(tokens, config.max_seq_len)
+    
+    if master_process:
+        print(f"📊 Dataset created with {len(dataset)} samples")
 
     # Train/val split
     val_size = len(dataset) // 10
@@ -765,5 +792,174 @@ def main():
     if dist.is_initialized():
         dist.destroy_process_group()
 
-if __name__ == "__main__":
+def launch_distributed():
+    """Launch distributed training with torchrun"""
+    import subprocess
+    import sys
+    import os
+    
+    print(f"🚀 Launching distributed training on {NUM_GPUS} GPUs...")
+    
+    # Check available GPUs
+    if torch.cuda.is_available():
+        available = torch.cuda.device_count()
+        print(f"🔍 Available GPUs: {available}")
+        if NUM_GPUS > available:
+            print(f"⚠️  Requested {NUM_GPUS} GPUs but only {available} available. Using {available}.")
+            num_gpus = available
+        else:
+            num_gpus = NUM_GPUS
+    else:
+        print("❌ CUDA not available!")
+        return
+    
+    # Get the script filename
+    try:
+        script_name = __file__
+    except NameError:
+        # We're in Jupyter or interactive environment
+        script_name = "train_distributed_llm.py"
+        if not os.path.exists(script_name):
+            print("❌ Cannot find train_distributed_llm.py file!")
+            print("💡 Make sure you're running this from the correct directory")
+            print("💡 Or run the training directly with: main()")
+            return
+    
+    # Use torchrun for proper distributed setup
+    cmd = [
+        "torchrun",
+        f"--nproc_per_node={num_gpus}",
+        "--nnodes=1",
+        "--node_rank=0", 
+        "--master_addr=localhost",
+        f"--master_port={MASTER_PORT}",
+        script_name,
+        "--distributed"
+    ]
+    
+    try:
+        subprocess.run(cmd, check=True)
+    except FileNotFoundError:
+        print("❌ torchrun not found. Using torch.distributed.launch instead...")
+        
+        # Fallback to torch.distributed.launch
+        cmd = [
+            sys.executable, "-m", "torch.distributed.launch",
+            f"--nproc_per_node={num_gpus}",
+            "--nnodes=1",
+            "--node_rank=0",
+            "--master_addr=localhost", 
+            f"--master_port={MASTER_PORT}",
+            script_name,
+            "--distributed"
+        ]
+        try:
+            subprocess.run(cmd, check=True)
+        except FileNotFoundError:
+            print("❌ Neither torchrun nor torch.distributed.launch found!")
+            print("💡 Running single-process training instead...")
+            print("💡 Install torchrun for proper multi-GPU training")
+            
+            # Fallback to single process with manual distributed setup
+            os.environ["RANK"] = "0"
+            os.environ["WORLD_SIZE"] = "1" 
+            os.environ["LOCAL_RANK"] = "0"
+            os.environ["MASTER_ADDR"] = "localhost"
+            os.environ["MASTER_PORT"] = MASTER_PORT
+            main()
+            
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Training failed with exit code {e.returncode}")
+        print(f"💡 Make sure you have {num_gpus} GPUs available and CUDA is properly installed")
+
+def run_training_direct():
+    """Run training directly without subprocess (for Jupyter/interactive use)"""
+    print("🔄 Running training directly (single process mode)...")
+    print("💡 For true multi-GPU training, run from command line: python train_distributed_llm.py")
+    
+    # Set up environment for single GPU
+    import os
+    os.environ["RANK"] = "0"
+    os.environ["WORLD_SIZE"] = "1"
+    os.environ["LOCAL_RANK"] = "0" 
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = MASTER_PORT
+    
     main()
+
+def run_kaggle_training():
+    """Optimized training for Kaggle environment"""
+    print("🔄 Running Kaggle-optimized training...")
+    
+    # Force single GPU for stability on Kaggle
+    import os
+    os.environ["RANK"] = "0"
+    os.environ["WORLD_SIZE"] = "1"
+    os.environ["LOCAL_RANK"] = "0"
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = MASTER_PORT
+    
+    # Reduce data size for faster loading
+    global BASE_BATCH_SIZE
+    BASE_BATCH_SIZE = 16  # Smaller batch size for T4
+    
+    try:
+        main()
+    except Exception as e:
+        print(f"❌ Training failed: {e}")
+        print("🔄 Trying with even smaller configuration...")
+        
+        # Further reduce for stability
+        BASE_BATCH_SIZE = 8
+        main()
+
+def run_novita_4090_training():
+    """Optimized training for Novita AI 2x RTX 4090 setup"""
+    print("🚀 Running Novita AI 2x RTX 4090 optimized training...")
+    print("💪 RTX 4090s detected - using high-performance configuration!")
+    
+    # Verify we have the right GPUs
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            gpu_name = torch.cuda.get_device_name(i)
+            memory_gb = torch.cuda.get_device_properties(i).total_memory / 1e9
+            print(f"🎯 GPU {i}: {gpu_name} ({memory_gb:.1f} GB)")
+    
+    # Set optimal environment for 2x 4090s
+    import os
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"  # Use both GPUs
+    
+    # Launch distributed training
+    try:
+        launch_distributed()
+    except Exception as e:
+        print(f"❌ Distributed training failed: {e}")
+        print("🔄 Falling back to single GPU training...")
+        run_training_direct()
+
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "--distributed":
+        # This is a distributed worker process launched by torchrun
+        main()
+    else:
+        # This is the main launcher process
+        print("=" * 80)
+        print("🤖 DISTRIBUTED LLM TRAINING")
+        print("=" * 80)
+        print(f"📋 Configuration:")
+        print(f"   GPUs: {NUM_GPUS}")
+        print(f"   GPU IDs: {GPU_IDS}")
+        print(f"   Batch size per GPU: {BASE_BATCH_SIZE}")
+        print(f"   Base learning rate: {BASE_LR}")
+        print(f"   Scale LR with GPUs: {SCALE_LR_WITH_GPUS}")
+        print("=" * 80)
+        
+        run_novita_4090_training()
+        # try:
+        #     launch_distributed()
+        # except Exception as e:
+        #     print(f"❌ Distributed launch failed: {e}")
+        #     print("🔄 Falling back to direct training...")
+        #     run_training_direct()
