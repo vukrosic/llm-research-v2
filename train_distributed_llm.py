@@ -9,8 +9,8 @@ GPU_IDS = [0, 1]                # Specific GPU IDs to use (e.g., [0,1,2,3] for 4
 
 # MODEL SCALING FOR MULTI-GPU - MEMORY OPTIMIZED FOR RTX 4090 (24GB VRAM each)
 # Adjust batch size and learning rate based on number of GPUs
-BASE_BATCH_SIZE = 16            # Conservative batch size to avoid OOM
-BASE_LR = 0.015                 # Adjusted learning rate
+BASE_BATCH_SIZE = 8             # Very conservative batch size to avoid OOM
+BASE_LR = 0.01                  # Adjusted learning rate
 SCALE_LR_WITH_GPUS = True       # Whether to scale LR with number of GPUs
 
 # =============================================================================
@@ -939,6 +939,10 @@ def run_novita_4090_training():
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"  # Use both GPUs
     
+    # Force memory-safe configuration
+    global BASE_BATCH_SIZE, NUM_GPUS
+    BASE_BATCH_SIZE = 4  # Very small batch size to start
+    
     # Verify we have the right GPUs and check memory
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
@@ -952,32 +956,14 @@ def run_novita_4090_training():
                 with torch.cuda.device(i):
                     torch.cuda.empty_cache()
     
-    # Reduce batch size further if needed
-    global BASE_BATCH_SIZE
-    original_batch_size = BASE_BATCH_SIZE
+    print(f"🔄 Using ultra-conservative settings: batch_size={BASE_BATCH_SIZE}, model=384d/6L")
     
     try:
-        print(f"🔄 Attempting training with batch size {BASE_BATCH_SIZE}...")
         launch_distributed()
-    except torch.cuda.OutOfMemoryError as e:
-        print(f"❌ OOM with batch size {BASE_BATCH_SIZE}: {e}")
-        print("🔄 Reducing batch size and trying again...")
-        
-        BASE_BATCH_SIZE = 8  # Much smaller batch size
-        try:
-            launch_distributed()
-        except Exception as e2:
-            print(f"❌ Still failed with batch size 8: {e2}")
-            print("🔄 Falling back to single GPU training...")
-            BASE_BATCH_SIZE = 4  # Very small batch size
-            run_training_direct()
     except Exception as e:
         print(f"❌ Distributed training failed: {e}")
         print("🔄 Falling back to single GPU training...")
         run_training_direct()
-    finally:
-        # Restore original batch size
-        BASE_BATCH_SIZE = original_batch_size
 
 if __name__ == "__main__":
     import sys
