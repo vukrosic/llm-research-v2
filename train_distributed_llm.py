@@ -7,10 +7,10 @@ MASTER_PORT = "12355"           # Port for distributed communication
 BACKEND = "nccl"                # Use "nccl" for NVIDIA GPUs, "gloo" for CPU
 GPU_IDS = [0, 1]                # Specific GPU IDs to use (e.g., [0,1,2,3] for 4 GPUs)
 
-# MODEL SCALING FOR MULTI-GPU - OPTIMIZED FOR RTX 4090 (24GB VRAM each)
+# MODEL SCALING FOR MULTI-GPU - MEMORY OPTIMIZED FOR RTX 4090 (24GB VRAM each)
 # Adjust batch size and learning rate based on number of GPUs
-BASE_BATCH_SIZE = 32            # Larger batch size for 4090s (24GB VRAM)
-BASE_LR = 0.02                  # Higher base learning rate for larger batches
+BASE_BATCH_SIZE = 16            # Conservative batch size to avoid OOM
+BASE_LR = 0.015                 # Adjusted learning rate
 SCALE_LR_WITH_GPUS = True       # Whether to scale LR with number of GPUs
 
 # =============================================================================
@@ -44,24 +44,32 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+def print_memory_usage(device_id=0):
+    """Print current GPU memory usage"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated(device_id) / 1e9
+        reserved = torch.cuda.memory_reserved(device_id) / 1e9
+        total = torch.cuda.get_device_properties(device_id).total_memory / 1e9
+        print(f"🔍 GPU {device_id} Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, {total:.2f}GB total")
+
 @dataclass
 class ModelConfig:
-    # Model architecture - SCALED UP FOR 4090s
-    d_model: int = 512              # Larger model for 4090s
+    # Model architecture - MEMORY OPTIMIZED FOR 4090s
+    d_model: int = 384              # Moderate size to fit memory
     n_heads: int = 8
-    n_layers: int = 8               # More layers
-    d_ff: int = 2048                # Larger feed-forward
+    n_layers: int = 6               # Fewer layers to save memory
+    d_ff: int = 1536                # Smaller feed-forward
     batch_size: int = BASE_BATCH_SIZE  # per GPU batch size
     max_steps: int = 10000          # More training steps
 
     # Training parameters
-    gradient_accumulation_steps: int = 2  # Less accumulation with larger batches
+    gradient_accumulation_steps: int = 4  # More accumulation, smaller memory footprint
     muon_lr: float = BASE_LR * (NUM_GPUS if SCALE_LR_WITH_GPUS else 1)
 
-    # Data parameters - MORE DATA FOR BETTER TRAINING
-    max_seq_len: int = 1024         # Longer sequences for 4090s
-    num_documents: int = 5000       # More documents
-    max_tokens: int = 2000000       # More tokens (2M)
+    # Data parameters - BALANCED FOR MEMORY
+    max_seq_len: int = 512          # Shorter sequences to save memory
+    num_documents: int = 3000       # Moderate number of documents
+    max_tokens: int = 1000000       # 1M tokens
 
     # Evaluation
     eval_every: int = 500
@@ -530,6 +538,10 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
     device = torch.device('cuda', rank)
     model = model.to(device)
 
+    # Check memory after model loading
+    if rank == 0:
+        print_memory_usage(rank)
+
     # Synchronize model parameters across all ranks
     for param in model.parameters():
         dist.broadcast(param.detach(), 0)
@@ -537,9 +549,13 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
     total_params = sum(p.numel() for p in model.parameters())
     if rank == 0:
         print(f"  📊 Total parameters: {total_params:,}")
+        print_memory_usage(rank)
 
     # Setup distributed optimizers
     optimizers = setup_distributed_optimizers(model, config)
+    
+    if rank == 0:
+        print_memory_usage(rank)
 
     # Learning rate schedule
     schedulers = []
@@ -914,28 +930,54 @@ def run_kaggle_training():
         main()
 
 def run_novita_4090_training():
-    """Optimized training for Novita AI 2x RTX 4090 setup"""
-    print("🚀 Running Novita AI 2x RTX 4090 optimized training...")
-    print("💪 RTX 4090s detected - using high-performance configuration!")
+    """Memory-optimized training for Novita AI 2x RTX 4090 setup"""
+    print("🚀 Running Novita AI 2x RTX 4090 memory-optimized training...")
+    print("💪 RTX 4090s detected - using memory-safe configuration!")
     
-    # Verify we have the right GPUs
+    # Set memory optimization environment variables
+    import os
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"  # Use both GPUs
+    
+    # Verify we have the right GPUs and check memory
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
             gpu_name = torch.cuda.get_device_name(i)
             memory_gb = torch.cuda.get_device_properties(i).total_memory / 1e9
             print(f"🎯 GPU {i}: {gpu_name} ({memory_gb:.1f} GB)")
+            
+            # Clear any existing memory
+            torch.cuda.empty_cache()
+            if i < torch.cuda.device_count():
+                with torch.cuda.device(i):
+                    torch.cuda.empty_cache()
     
-    # Set optimal environment for 2x 4090s
-    import os
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"  # Use both GPUs
+    # Reduce batch size further if needed
+    global BASE_BATCH_SIZE
+    original_batch_size = BASE_BATCH_SIZE
     
-    # Launch distributed training
     try:
+        print(f"🔄 Attempting training with batch size {BASE_BATCH_SIZE}...")
         launch_distributed()
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"❌ OOM with batch size {BASE_BATCH_SIZE}: {e}")
+        print("🔄 Reducing batch size and trying again...")
+        
+        BASE_BATCH_SIZE = 8  # Much smaller batch size
+        try:
+            launch_distributed()
+        except Exception as e2:
+            print(f"❌ Still failed with batch size 8: {e2}")
+            print("🔄 Falling back to single GPU training...")
+            BASE_BATCH_SIZE = 4  # Very small batch size
+            run_training_direct()
     except Exception as e:
         print(f"❌ Distributed training failed: {e}")
         print("🔄 Falling back to single GPU training...")
         run_training_direct()
+    finally:
+        # Restore original batch size
+        BASE_BATCH_SIZE = original_batch_size
 
 if __name__ == "__main__":
     import sys
