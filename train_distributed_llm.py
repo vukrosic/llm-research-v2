@@ -245,67 +245,87 @@ class DistAdam(torch.optim.Optimizer):
         torch.futures.collect_all(all_reduce_futures).wait()
 
 def load_and_cache_data(config: ModelConfig, cache_dir: str = "data_cache", rank: int = 0):
-    """Load and cache tokenized data to avoid reprocessing"""
+    """Load and cache tokenized data with proper distributed handling"""
     os.makedirs(cache_dir, exist_ok=True)
     cache_file = f"{cache_dir}/tokenized_data_{config.num_documents}_{config.max_tokens}.pkl"
 
-    # Simplified approach: all ranks load data independently to avoid broadcast issues
-    if os.path.exists(cache_file):
-        if rank == 0:
+    # Only rank 0 loads/processes data, then broadcasts to other ranks
+    if rank == 0:
+        if os.path.exists(cache_file):
             print(f"📦 Loading cached data from {cache_file}")
-        with open(cache_file, 'rb') as f:
-            cached_data = pickle.load(f)
-    else:
-        if rank == 0:
+            with open(cache_file, 'rb') as f:
+                cached_data = pickle.load(f)
+        else:
             print(f"🔄 Processing new data (will cache for future use)")
             
-        tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM-135M", token=False)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+            tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM-135M", token=False)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
 
-        dataset = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", 
-                              split="train", streaming=True, token=False)
+            dataset = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", 
+                                  split="train", streaming=True, token=False)
 
-        texts = []
-        for i, item in enumerate(dataset):
-            if i >= config.num_documents:
-                break
-            texts.append(item["text"][:3000])
+            texts = []
+            for i, item in enumerate(dataset):
+                if i >= config.num_documents:
+                    break
+                texts.append(item["text"][:3000])
 
-        if rank == 0:
             print(f"Loaded {len(texts)} documents")
             print("Tokenizing texts...")
-        
-        all_tokens = []
-        for text in (tqdm(texts, desc="Tokenizing") if rank == 0 else texts):
-            tokens = tokenizer.encode(text, add_special_tokens=False)
-            all_tokens.extend(tokens)
+            
+            all_tokens = []
+            for text in tqdm(texts, desc="Tokenizing"):
+                tokens = tokenizer.encode(text, add_special_tokens=False)
+                all_tokens.extend(tokens)
 
-        tokens = all_tokens[:config.max_tokens]
-        if rank == 0:
+            tokens = all_tokens[:config.max_tokens]
             print(f"Using {len(tokens):,} tokens")
-        
-        cached_data = {'texts': texts, 'tokenizer': tokenizer, 'tokens': tokens}
-        
-        # Only rank 0 saves cache
-        if rank == 0:
+            
+            cached_data = {'texts': texts, 'tokenizer': tokenizer, 'tokens': tokens}
+            
             with open(cache_file, 'wb') as f:
                 pickle.dump(cached_data, f)
             print(f"💾 Cached data to {cache_file}")
+    else:
+        # Other ranks wait for rank 0 to finish
+        cached_data = None
     
-    # Simple barrier to ensure all ranks are ready
+    # Synchronize all ranks
     if dist.is_initialized():
         dist.barrier()
+        
+        # Broadcast data from rank 0 to all other ranks
+        if rank == 0:
+            # Prepare data for broadcast
+            broadcast_data = {
+                'vocab_size': cached_data['tokenizer'].vocab_size,
+                'tokens': cached_data['tokens']
+            }
+        else:
+            broadcast_data = None
+            
+        # Use object_list for broadcasting complex objects
+        broadcast_list = [broadcast_data]
+        dist.broadcast_object_list(broadcast_list, src=0)
+        broadcast_data = broadcast_list[0]
+        
+        if rank != 0:
+            # Reconstruct tokenizer on other ranks
+            tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM-135M", token=False)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            cached_data = {
+                'tokenizer': tokenizer,
+                'tokens': broadcast_data['tokens']
+            }
     
-    texts = cached_data['texts']
-    tokenizer = cached_data['tokenizer']
-    tokens = cached_data['tokens']
-    config.vocab_size = tokenizer.vocab_size
-
+    config.vocab_size = cached_data['tokenizer'].vocab_size
+    
     if rank == 0:
-        print(f"✅ Loaded {len(texts)} documents, {len(tokens):,} tokens")
+        print(f"✅ Data distributed to all ranks: {len(cached_data['tokens']):,} tokens")
     
-    return texts, tokenizer, tokens
+    return None, cached_data['tokenizer'], cached_data['tokens']
 
 class TextTokenDataset(Dataset):
     def __init__(self, tokens: List[int], seq_len: int = 512):
@@ -500,25 +520,50 @@ def setup_distributed_optimizers(model: nn.Module, config: ModelConfig):
     return [muon_optimizer, adamw_optimizer]
 
 class DistributedSampler:
-    """Simple distributed sampler"""
-    def __init__(self, dataset, rank, world_size, shuffle=True):
+    """Improved distributed sampler with better load balancing"""
+    def __init__(self, dataset, rank, world_size, shuffle=True, drop_last=False):
         self.dataset = dataset
         self.rank = rank
         self.world_size = world_size
         self.shuffle = shuffle
+        self.drop_last = drop_last
         self.epoch = 0
         
-    def __iter__(self):
-        indices = list(range(len(self.dataset)))
-        if self.shuffle:
-            random.Random(self.epoch).shuffle(indices)
+        # Calculate samples per rank with proper padding
+        self.total_size = len(dataset)
+        if self.drop_last:
+            self.num_samples = self.total_size // self.world_size
+        else:
+            self.num_samples = (self.total_size + self.world_size - 1) // self.world_size
         
-        # Distribute indices across ranks
-        indices = indices[self.rank::self.world_size]
+        # Ensure all ranks have the same number of samples
+        self.padded_size = self.num_samples * self.world_size
+        
+    def __iter__(self):
+        # Generate indices
+        indices = list(range(self.total_size))
+        
+        if self.shuffle:
+            # Use epoch as seed for consistent shuffling across ranks
+            g = torch.Generator()
+            g.manual_seed(self.epoch)
+            indices = torch.randperm(len(indices), generator=g).tolist()
+        
+        # Pad indices to make it evenly divisible by world_size
+        if not self.drop_last:
+            padding_size = self.padded_size - len(indices)
+            if padding_size > 0:
+                indices += indices[:padding_size]
+        
+        # Subsample for this rank
+        indices = indices[self.rank:self.padded_size:self.world_size]
+        
+        assert len(indices) == self.num_samples, f"Expected {self.num_samples}, got {len(indices)}"
+        
         return iter(indices)
     
     def __len__(self):
-        return len(self.dataset) // self.world_size
+        return self.num_samples
     
     def set_epoch(self, epoch):
         self.epoch = epoch
@@ -582,11 +627,19 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
     pbar = tqdm(total=config.max_steps, desc="Training") if rank == 0 else None
 
     while step < config.max_steps:
+        # Set epoch for proper shuffling
+        train_sampler.set_epoch(step // len(train_loader))
+        
         for batch_idx, (x, y) in enumerate(train_loader):
             if step >= config.max_steps:
                 break
 
-            x, y = x.to(device), y.to(device)
+            # Ensure synchronized data loading across ranks
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            
+            # Synchronize before forward pass to ensure all ranks are ready
+            if step % 100 == 0:
+                dist.barrier()
 
             # Forward pass with gradient accumulation
             if config.use_amp:
@@ -603,6 +656,9 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
 
             # Optimizer step after accumulation
             if (step + 1) % config.gradient_accumulation_steps == 0:
+                # Synchronize gradients across all ranks
+                dist.barrier()
+                
                 if config.use_amp:
                     for optimizer in optimizers:
                         scaler.unscale_(optimizer)
@@ -621,6 +677,10 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
                         optimizer.zero_grad()
                     for scheduler in schedulers:
                         scheduler.step()
+                
+                # Clear cache periodically to prevent memory fragmentation
+                if step % 500 == 0:
+                    torch.cuda.empty_cache()
 
             # Logging (only rank 0)
             if step % 100 == 0 and rank == 0:
@@ -766,25 +826,31 @@ def main():
         dataset, [train_size, val_size], generator=generator
     )
 
-    # Create distributed samplers
-    train_sampler = DistributedSampler(train_dataset, rank, world_size, shuffle=True)
-    val_sampler = DistributedSampler(val_dataset, rank, world_size, shuffle=False)
+    # Create distributed samplers with proper load balancing
+    train_sampler = DistributedSampler(train_dataset, rank, world_size, shuffle=True, drop_last=True)
+    val_sampler = DistributedSampler(val_dataset, rank, world_size, shuffle=False, drop_last=False)
 
-    # Create data loaders with samplers
+    # Create data loaders with optimized settings for distributed training
     train_loader = DataLoader(
         train_dataset, 
         batch_size=config.batch_size,
         sampler=train_sampler,
-        num_workers=2,
-        pin_memory=True
+        num_workers=min(4, os.cpu_count() // world_size),  # Balanced workers per GPU
+        pin_memory=True,
+        persistent_workers=True,  # Keep workers alive between epochs
+        prefetch_factor=2,  # Prefetch batches
+        drop_last=True  # Ensure consistent batch sizes across ranks
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
         sampler=val_sampler,
-        num_workers=2,
-        pin_memory=True
+        num_workers=min(2, os.cpu_count() // world_size),
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
+        drop_last=False
     )
 
     if master_process:
@@ -941,7 +1007,7 @@ def run_novita_4090_training():
     
     # Force memory-safe configuration
     global BASE_BATCH_SIZE, NUM_GPUS
-    BASE_BATCH_SIZE = 4  # Very small batch size to start
+    BASE_BATCH_SIZE = 6  # Slightly larger but still safe
     
     # Verify we have the right GPUs and check memory
     if torch.cuda.is_available():
@@ -950,27 +1016,205 @@ def run_novita_4090_training():
             memory_gb = torch.cuda.get_device_properties(i).total_memory / 1e9
             print(f"🎯 GPU {i}: {gpu_name} ({memory_gb:.1f} GB)")
             
-            # Clear any existing memory
+            # Clear any existing memory and set memory fraction
             torch.cuda.empty_cache()
             if i < torch.cuda.device_count():
                 with torch.cuda.device(i):
                     torch.cuda.empty_cache()
+                    # Reserve some memory to prevent fragmentation
+                    torch.cuda.set_per_process_memory_fraction(0.9, device=i)
     
-    print(f"🔄 Using ultra-conservative settings: batch_size={BASE_BATCH_SIZE}, model=384d/6L")
+    print(f"🔄 Using balanced settings: batch_size={BASE_BATCH_SIZE}, model=384d/6L")
+    print("🔧 Trying PyTorch DDP for better load balancing...")
     
     try:
-        launch_distributed()
+        # Try with PyTorch's native DDP first
+        launch_distributed_ddp()
     except Exception as e:
-        print(f"❌ Distributed training failed: {e}")
-        print("🔄 Falling back to single GPU training...")
-        run_training_direct()
+        print(f"❌ DDP training failed: {e}")
+        print("🔄 Trying custom distributed training...")
+        try:
+            launch_distributed()
+        except Exception as e2:
+            print(f"❌ Custom distributed training failed: {e2}")
+            print("🔄 Falling back to single GPU training...")
+            run_training_direct()
+
+def launch_distributed_ddp():
+    """Launch distributed training using PyTorch's native DDP"""
+    import subprocess
+    import sys
+    
+    cmd = [
+        sys.executable, "-m", "torch.distributed.launch",
+        "--nproc_per_node=2",
+        "--master_port=12355",
+        "--use_env",
+        __file__, "--ddp"
+    ]
+    
+    print(f"🚀 Launching DDP training: {' '.join(cmd)}")
+    result = subprocess.run(cmd, check=True)
+    return result.returncode == 0
+
+def main_ddp():
+    """Main function for DDP training"""
+    # Initialize distributed training
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    
+    # Set device
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    
+    # Initialize process group
+    dist.init_process_group(backend="nccl")
+    
+    if rank == 0:
+        print(f"🔧 DDP initialized: {world_size} GPUs")
+    
+    # Set seed
+    set_seed(42 + rank)
+    
+    # Create config
+    config = ModelConfig()
+    
+    # Load data (only rank 0 loads, then broadcasts)
+    texts, tokenizer, tokens = load_and_cache_data(config, rank=rank)
+    dataset = TextTokenDataset(tokens, config.max_seq_len)
+    
+    # Split data
+    val_size = len(dataset) // 10
+    train_size = len(dataset) - val_size
+    generator = torch.Generator().manual_seed(42)
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size], generator=generator
+    )
+    
+    # Use PyTorch's DistributedSampler
+    from torch.utils.data.distributed import DistributedSampler as PyTorchDistributedSampler
+    
+    train_sampler = PyTorchDistributedSampler(train_dataset, shuffle=True, drop_last=True)
+    val_sampler = PyTorchDistributedSampler(val_dataset, shuffle=False, drop_last=False)
+    
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        sampler=train_sampler,
+        num_workers=2,
+        pin_memory=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.batch_size,
+        sampler=val_sampler,
+        num_workers=2,
+        pin_memory=True
+    )
+    
+    # Create model and wrap with DDP
+    model = MinimalLLM(config).to(device)
+    model = torch.nn.parallel.DistributedDataParallel(
+        model, 
+        device_ids=[local_rank],
+        output_device=local_rank,
+        find_unused_parameters=False,
+        broadcast_buffers=False
+    )
+    
+    # Use standard optimizers instead of custom distributed ones
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.muon_lr,
+        weight_decay=config.weight_decay,
+        betas=(0.9, 0.999)
+    )
+    
+    # Learning rate scheduler
+    warmup_steps = config.max_steps // 20
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        else:
+            progress = (step - warmup_steps) / (config.max_steps - warmup_steps)
+            return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
+    
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scaler = GradScaler() if config.use_amp else None
+    
+    # Training loop
+    model.train()
+    step = 0
+    start_time = time.time()
+    
+    pbar = tqdm(total=config.max_steps, desc="DDP Training") if rank == 0 else None
+    
+    while step < config.max_steps:
+        train_sampler.set_epoch(step // len(train_loader))
+        
+        for x, y in train_loader:
+            if step >= config.max_steps:
+                break
+                
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            
+            optimizer.zero_grad()
+            
+            if config.use_amp:
+                with autocast():
+                    logits = model(x)
+                    loss = F.cross_entropy(logits.view(-1, config.vocab_size), y.view(-1))
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                logits = model(x)
+                loss = F.cross_entropy(logits.view(-1, config.vocab_size), y.view(-1))
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                optimizer.step()
+            
+            scheduler.step()
+            
+            # Logging
+            if step % 100 == 0 and rank == 0:
+                with torch.no_grad():
+                    predictions = logits.argmax(dim=-1)
+                    accuracy = (predictions == y).float().mean().item()
+                    perplexity = math.exp(min(loss.item(), 20))
+                
+                pbar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'acc': f'{accuracy:.3f}',
+                    'ppl': f'{perplexity:.1f}',
+                    'lr': f'{optimizer.param_groups[0]["lr"]:.2e}'
+                })
+                pbar.update(100)
+            
+            step += 1
+    
+    if rank == 0:
+        pbar.close()
+        print(f"🎉 DDP Training completed in {time.time() - start_time:.1f} seconds")
+    
+    # Cleanup
+    dist.destroy_process_group()
 
 if __name__ == "__main__":
     import sys
     
-    if len(sys.argv) > 1 and sys.argv[1] == "--distributed":
-        # This is a distributed worker process launched by torchrun
-        main()
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--distributed":
+            # This is a distributed worker process launched by torchrun
+            main()
+        elif sys.argv[1] == "--ddp":
+            # This is a DDP worker process
+            main_ddp()
     else:
         # This is the main launcher process
         print("=" * 80)
@@ -985,9 +1229,3 @@ if __name__ == "__main__":
         print("=" * 80)
         
         run_novita_4090_training()
-        # try:
-        #     launch_distributed()
-        # except Exception as e:
-        #     print(f"❌ Distributed launch failed: {e}")
-        #     print("🔄 Falling back to direct training...")
-        #     run_training_direct()
