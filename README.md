@@ -19,7 +19,7 @@ cd build-and-release-your-own-llm
 python setup.py  # Installs requirements and creates .env file
 ```
 
-## 🎯 Three Ways to Use This Project
+## 🎯 Four Ways to Use This Project
 
 ### 1. 🚀 Quick Start - Use My Pre-trained Model
 
@@ -40,9 +40,9 @@ The script will:
 
 **No setup required!** The model downloads automatically.
 
-### 2. 🏗️ Train Your Own Model
+### 2. 🏗️ Train Your Own Model (Single GPU)
 
-Want to train from scratch?
+Want to train from scratch on one GPU?
 
 ```bash
 # Install dependencies
@@ -57,7 +57,41 @@ python inference.py
 
 Your model will be saved in `checkpoints/` and you can resume training anytime.
 
-### 3. 📤 Train and Share Your Model
+### 3. ⚡ Distributed Training (Multi-GPU)
+
+Want to train faster with multiple GPUs?
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# For 2x RTX 4090 or similar high-end GPUs:
+python run_4090.py
+
+# Monitor GPU utilization (in another terminal):
+python gpu_monitor.py
+
+# If you experience GPU imbalance, run diagnostics:
+python fix_gpu_imbalance.py
+```
+
+**Distributed Training Features:**
+- **Automatic GPU detection** and memory optimization
+- **Load balancing** across multiple GPUs
+- **Real-time monitoring** of GPU utilization
+- **Fallback options** if distributed training fails
+- **Memory-safe settings** for RTX 4090 class GPUs
+
+**GPU Utilization Monitoring:**
+The `gpu_monitor.py` script shows real-time GPU stats:
+```
+[14:23:45] GPU Status:
+  GPU 0: 🟢  87% util | 18234/24564MB (74.2%) | 67°C | NVIDIA GeForce RTX 4090
+  GPU 1: 🟢  89% util | 18891/24564MB (76.9%) | 69°C | NVIDIA GeForce RTX 4090
+  📊 Average: 88.0% | Range: 87%-89% | Imbalance: 2%
+```
+
+### 4. 📤 Train and Share Your Model
 
 Want to share your model on Hugging Face?
 
@@ -70,8 +104,10 @@ cp .env.example .env
 # HF_TOKEN=hf_your_token_here
 # PUSH_TO_HUB=true
 
-# 3. Train (uploads automatically)
-python train_llm.py
+# 3. Train (single or multi-GPU)
+python train_llm.py          # Single GPU
+# OR
+python run_4090.py           # Multi-GPU
 ```
 
 Get your HF token from: https://huggingface.co/settings/tokens
@@ -79,14 +115,18 @@ Get your HF token from: https://huggingface.co/settings/tokens
 ## 📁 Project Structure
 
 ```
-├── train_llm.py       # Training script with Muon optimizer
-├── inference.py       # Text generation and model loading
-├── upload_to_hf.py    # Upload checkpoints to Hugging Face
-├── example_usage.py   # Example workflow script
-├── setup.py          # Easy setup script
-├── requirements.txt   # Python dependencies
-├── .env.example      # Environment variables template
-└── README.md         # This file
+├── train_llm.py              # Single GPU training with Muon optimizer
+├── train_distributed_llm.py  # Multi-GPU distributed training
+├── run_4090.py               # Optimized launcher for RTX 4090 class GPUs
+├── gpu_monitor.py            # Real-time GPU utilization monitoring
+├── fix_gpu_imbalance.py      # Diagnostic tool for GPU load balancing
+├── inference.py              # Text generation and model loading
+├── upload_to_hf.py           # Upload checkpoints to Hugging Face
+├── example_usage.py          # Example workflow script
+├── setup.py                  # Easy setup script
+├── requirements.txt          # Python dependencies
+├── .env.example             # Environment variables template
+└── README.md                # This file
 ```
 
 ## 🎯 What You Get
@@ -172,13 +212,104 @@ Check your token permissions:
 2. Make sure token has "Write" permission
 3. Update your `.env` file
 
+## ⚡ Distributed Training Guide
+
+### Understanding the Scripts
+
+**`run_4090.py`** - The main launcher that:
+- Sets optimal memory settings for RTX 4090 class GPUs
+- Clears GPU memory to prevent fragmentation
+- Calls `run_novita_4090_training()` from `train_distributed_llm.py`
+- Provides fallback options if distributed training fails
+
+**`train_distributed_llm.py`** - Contains the distributed training logic:
+- `run_novita_4090_training()` - Main entry point for multi-GPU training
+- `launch_distributed_ddp()` - PyTorch native DDP implementation (recommended)
+- `launch_distributed()` - Custom distributed training with Muon optimizer
+- `main_ddp()` - DDP training loop with standard optimizers
+- `main()` - Custom distributed training loop
+
+### Training Flow
+
+1. **`run_4090.py`** → calls → **`run_novita_4090_training()`**
+2. **`run_novita_4090_training()`** tries in order:
+   - PyTorch DDP (most reliable)
+   - Custom distributed training
+   - Single GPU fallback
+
+### GPU Utilization Troubleshooting
+
+If you see uneven GPU utilization (e.g., 90% vs 19%):
+
+```bash
+# 1. Run diagnostics
+python fix_gpu_imbalance.py
+
+# 2. Monitor in real-time
+python gpu_monitor.py
+
+# 3. Try the balanced launcher
+python run_balanced.py  # Created by fix_gpu_imbalance.py
+```
+
+**Common Causes of GPU Imbalance:**
+- Data loading bottlenecks
+- Memory fragmentation
+- Poor batch distribution
+- CPU affinity issues
+
+**Solutions Applied:**
+- Rank 0 loads data, broadcasts to other GPUs
+- Improved distributed samplers with proper padding
+- Memory optimization and periodic cache clearing
+- CPU affinity optimization for data loading
+
+**Note on GPU Monitoring:**
+Different monitoring tools may show different utilization percentages:
+- **Novita UI**: May show instantaneous or averaged values
+- **gpu_monitor.py**: Shows real-time utilization every 2 seconds
+- **nvidia-smi**: Shows current utilization at query time
+
+If you see discrepancies (e.g., Novita shows 90%/19% but gpu_monitor.py shows 90%/90%), this usually means:
+- The imbalance is intermittent (happening between measurements)
+- Different measurement intervals are being used
+- One tool is showing peak values while another shows averages
+
+**Recommendation**: Run `gpu_monitor.py` for several minutes to see the true utilization pattern over time.
+
+### Advanced Configuration
+
+Edit `train_distributed_llm.py` to customize:
+
+```python
+# At the top of the file:
+NUM_GPUS = 2                    # Number of GPUs to use
+BASE_BATCH_SIZE = 6             # Batch size per GPU
+BASE_LR = 0.01                  # Base learning rate
+GPU_IDS = [0, 1]                # Specific GPU IDs to use
+```
+
+### Performance Expectations
+
+**Single GPU (RTX 4090):**
+- Training time: ~16-20 minutes
+- Memory usage: ~18-20GB
+- Utilization: ~85-95%
+
+**Dual GPU (2x RTX 4090):**
+- Training time: ~8-12 minutes
+- Memory usage: ~18-20GB per GPU
+- Utilization: ~80-90% each (balanced)
+
 ## 🎉 What's Next?
 
 1. **Experiment with prompts** - Try different starting texts
 2. **Adjust generation parameters** - Change temperature and top_k in inference.py
 3. **Train on your data** - Replace the dataset with your own text
 4. **Scale up** - Increase model size for better performance
-5. **Share your model** - Upload to Hugging Face for others to use
+5. **Multi-GPU training** - Use distributed training for faster results
+6. **Monitor performance** - Use gpu_monitor.py to optimize utilization
+7. **Share your model** - Upload to Hugging Face for others to use
 
 ## 📦 Checkpoint Management
 

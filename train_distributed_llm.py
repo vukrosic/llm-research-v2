@@ -996,7 +996,17 @@ def run_kaggle_training():
         main()
 
 def run_novita_4090_training():
-    """Memory-optimized training for Novita AI 2x RTX 4090 setup"""
+    """
+    Main entry point for distributed training on RTX 4090 class GPUs.
+    
+    This function is called by run_4090.py and handles the complete training pipeline:
+    1. Sets up memory-optimized configuration for RTX 4090s
+    2. Tries PyTorch DDP first (most reliable)
+    3. Falls back to custom distributed training if DDP fails
+    4. Falls back to single GPU training if all distributed methods fail
+    
+    The function automatically detects available GPUs and optimizes settings accordingly.
+    """
     print("🚀 Running Novita AI 2x RTX 4090 memory-optimized training...")
     print("💪 RTX 4090s detected - using memory-safe configuration!")
     
