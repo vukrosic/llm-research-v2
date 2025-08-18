@@ -88,7 +88,12 @@ class Muon(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
     @torch.no_grad()
-    def step(self):
+    def step(self, closure=None):  # Add closure parameter
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
         for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is None:
@@ -105,6 +110,8 @@ class Muon(torch.optim.Optimizer):
                 g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
                 g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
                 p.add_(g.view_as(p), alpha=-group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5)
+
+        return loss  # Return loss if closure was provided
 
 def load_and_cache_data(config: ModelConfig, accelerator: Accelerator, cache_dir: str = "data_cache"):
     """Load and cache tokenized data to avoid reprocessing"""
