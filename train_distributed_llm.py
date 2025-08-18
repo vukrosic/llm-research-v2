@@ -32,6 +32,8 @@ from dataclasses import dataclass
 from typing import List, Optional
 import warnings
 import os
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 import pickle
 warnings.filterwarnings('ignore')
 
@@ -761,7 +763,10 @@ def setup_distributed():
     try:
         import datetime
         timeout = datetime.timedelta(seconds=30)  # 30 second timeout
-        dist.init_process_group(backend=BACKEND, timeout=timeout)
+        try:
+            dist.init_process_group(backend=BACKEND, timeout=timeout, device_id=gpu_id)
+        except TypeError:
+            dist.init_process_group(backend=BACKEND, timeout=timeout)
         print(f"🔧 Rank {rank}: Process group initialized")
         
         # Test barrier
@@ -908,6 +913,9 @@ def launch_distributed():
             print("💡 Or run the training directly with: main()")
             return
     
+    env = os.environ.copy()
+    env.setdefault("OMP_NUM_THREADS", "1")
+    env.setdefault("TOKENIZERS_PARALLELISM", "false")
     # Use torchrun for proper distributed setup
     cmd = [
         "torchrun",
@@ -921,7 +929,7 @@ def launch_distributed():
     ]
     
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, env=env)
     except FileNotFoundError:
         print("❌ torchrun not found. Using torch.distributed.launch instead...")
         
@@ -937,7 +945,7 @@ def launch_distributed():
             "--distributed"
         ]
         try:
-            subprocess.run(cmd, check=True)
+            subprocess.run(cmd, check=True, env=env)
         except FileNotFoundError:
             print("❌ Neither torchrun nor torch.distributed.launch found!")
             print("💡 Running single-process training instead...")
@@ -1055,17 +1063,20 @@ def launch_distributed_ddp():
     """Launch distributed training using PyTorch's native DDP"""
     import subprocess
     import sys
+    import os
     
+    env = os.environ.copy()
+    env.setdefault("OMP_NUM_THREADS", "1")
+    env.setdefault("TOKENIZERS_PARALLELISM", "false")
     cmd = [
-        sys.executable, "-m", "torch.distributed.launch",
+        sys.executable, "-m", "torch.distributed.run",
         "--nproc_per_node=2",
-        "--master_port=12355",
-        "--use_env",
+        f"--master_port={MASTER_PORT}",
         __file__, "--ddp"
     ]
     
     print(f"🚀 Launching DDP training: {' '.join(cmd)}")
-    result = subprocess.run(cmd, check=True)
+    result = subprocess.run(cmd, check=True, env=env)
     return result.returncode == 0
 
 def main_ddp():
@@ -1080,7 +1091,10 @@ def main_ddp():
     device = torch.device("cuda", local_rank)
     
     # Initialize process group
-    dist.init_process_group(backend="nccl")
+    try:
+        dist.init_process_group(backend="nccl", device_id=local_rank)
+    except TypeError:
+        dist.init_process_group(backend="nccl")
     
     if rank == 0:
         print(f"🔧 DDP initialized: {world_size} GPUs")
