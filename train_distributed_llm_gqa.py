@@ -363,13 +363,19 @@ class Rotary(nn.Module):
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, max_seq_len: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, n_heads: int, max_seq_len: int, dropout: float = 0.1, num_kv_heads: Optional[int] = None):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else n_heads
         self.d_k = d_model // n_heads
 
-        self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
+        # Ensure d_model is divisible by num_kv_heads for K and V
+        assert d_model % self.num_kv_heads == 0, "d_model must be divisible by num_kv_heads"
+        self.d_kv = d_model // self.num_kv_heads
+
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.kv_proj = nn.Linear(d_model, self.num_kv_heads * self.d_kv * 2, bias=False)
         self.w_o = nn.Linear(d_model, d_model, bias=False)
         self.rotary = Rotary(self.d_k, max_seq_len)
         self.dropout = dropout
@@ -377,12 +383,17 @@ class MultiHeadAttention(nn.Module):
     def forward(self, x):
         batch_size, seq_len = x.size(0), x.size(1)
 
-        qkv = self.qkv(x).reshape(batch_size, seq_len, 3, self.n_heads, self.d_k)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        Q, K, V = qkv[0], qkv[1], qkv[2]
+        Q = self.q_proj(x).reshape(batch_size, seq_len, self.n_heads, self.d_k).permute(0, 2, 1, 3)
+        KV = self.kv_proj(x).reshape(batch_size, seq_len, 2, self.num_kv_heads, self.d_kv)
+        K, V = KV[:, :, 0].permute(0, 2, 1, 3), KV[:, :, 1].permute(0, 2, 1, 3)
 
         Q = self.rotary(Q)
         K = self.rotary(K)
+
+        # Repeat K and V heads if num_kv_heads < n_heads (GQA)
+        if self.num_kv_heads < self.n_heads:
+            K = K.repeat_interleave(self.n_heads // self.num_kv_heads, dim=1)
+            V = V.repeat_interleave(self.n_heads // self.num_kv_heads, dim=1)
 
         attn_output = F.scaled_dot_product_attention(
             Q, K, V, is_causal=True, dropout_p=self.dropout if self.training else 0.0
@@ -401,9 +412,9 @@ class FeedForward(nn.Module):
         return self.linear2(self.dropout(F.silu(self.linear1(x))))
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, max_seq_len: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, max_seq_len: int, dropout: float = 0.1, num_kv_heads: Optional[int] = None):
         super().__init__()
-        self.attention = MultiHeadAttention(d_model, n_heads, max_seq_len, dropout)
+        self.attention = MultiHeadAttention(d_model, n_heads, max_seq_len, dropout, num_kv_heads)
         self.feed_forward = FeedForward(d_model, d_ff, dropout)
         self.norm1 = nn.RMSNorm(d_model)
         self.norm2 = nn.RMSNorm(d_model)
@@ -425,7 +436,7 @@ class MinimalLLM(nn.Module):
         self.position_dropout = nn.Dropout(config.dropout)
 
         self.transformer_blocks = nn.ModuleList([
-            TransformerBlock(config.d_model, config.n_heads, config.d_ff, config.max_seq_len, config.dropout)
+            TransformerBlock(config.d_model, config.n_heads, config.d_ff, config.max_seq_len, config.dropout, config.num_kv_heads)
             for _ in range(config.n_layers)
         ])
 
