@@ -324,10 +324,15 @@ def evaluate_model(model: nn.Module, val_loader: DataLoader, config: ModelConfig
             predictions = logits.argmax(dim=-1)
             total_correct += (predictions == y).sum().item()
 
+    # Create tensors on the correct device before gathering
+    total_loss_tensor = torch.tensor(total_loss, device=accelerator.device)
+    total_tokens_tensor = torch.tensor(total_tokens, device=accelerator.device)
+    total_correct_tensor = torch.tensor(total_correct, device=accelerator.device)
+
     # Gather metrics from all processes
-    total_loss = accelerator.gather(torch.tensor(total_loss))
-    total_tokens = accelerator.gather(torch.tensor(total_tokens))
-    total_correct = accelerator.gather(torch.tensor(total_correct))
+    total_loss = accelerator.gather(total_loss_tensor)
+    total_tokens = accelerator.gather(total_tokens_tensor)
+    total_correct = accelerator.gather(total_correct_tensor)
 
     # Sum across all processes
     total_loss = total_loss.sum().item()
