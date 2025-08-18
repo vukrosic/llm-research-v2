@@ -34,17 +34,18 @@ logger = get_logger(__name__)
 
 @dataclass
 class ModelConfig:
-    # Smaller model for debugging
-    d_model: int = 256              # Reduced from 384
+    # Model architecture - OPTIMIZED FOR RTX 4090s
+    d_model: int = 256              # Reduced from 384 for debugging
     n_heads: int = 8
-    n_layers: int = 4               # Reduced from 6
-    d_ff: int = 1024                # Reduced from 1536
-    batch_size: int = 8             # Reduced from 12
+    num_kv_heads: Optional[int] = None  # Keep this for GQA support
+    n_layers: int = 4               # Reduced from 6 for debugging
+    d_ff: int = 1024                # Reduced from 1536 for debugging
+    batch_size: int = 8             # Reduced from 12 for debugging
     max_steps: int = 1000           # Reduced for faster debugging
 
     # Training parameters - FIXED VALUES
     gradient_accumulation_steps: int = 4
-    learning_rate: float = 1e-4  # Reduced from 1e-3
+    learning_rate: float = 1e-4     # Reduced from 1e-3
 
     # Data parameters
     max_seq_len: int = 512          # Sequence length
@@ -56,9 +57,9 @@ class ModelConfig:
     eval_steps: int = 100
 
     # Regularization - FIXED VALUES
-    weight_decay: float = 0.01   # Reduced from 0.1
+    weight_decay: float = 0.01      # Reduced from 0.1
     dropout: float = 0.1
-    grad_clip: float = 5.0       # Increased from 1.0
+    grad_clip: float = 5.0          # Increased from 1.0
 
     # Technical
     use_amp: bool = True            # Mixed precision
@@ -374,21 +375,19 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
     # Setup optimizers
     optimizers = setup_optimizers(model, config)
     
-    # Better learning rate schedule
-    schedulers = []
-    for optimizer in optimizers:
-        warmup_steps = min(config.max_steps // 10, 1000)  # Cap warmup at 1000 steps
-        
-        def lr_lambda(step):
-            if step < warmup_steps:
-                return step / warmup_steps
-            else:
-                # Cosine decay with longer tail
-                progress = (step - warmup_steps) / (config.max_steps - warmup_steps)
-                return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
-        
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-        schedulers.append(scheduler)
+    # Better learning rate schedule for single optimizer
+    warmup_steps = min(config.max_steps // 10, 1000)  # Cap warmup at 1000 steps
+    
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        else:
+            # Cosine decay with longer tail
+            progress = (step - warmup_steps) / (config.max_steps - warmup_steps)
+            return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
+    
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizers[0], lr_lambda)
+    schedulers = [scheduler]
 
     # Prepare everything with Accelerate
     model, optimizers, train_loader, val_loader, schedulers = accelerator.prepare(
@@ -443,8 +442,7 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
                     'loss': f'{loss.item():.4f}',
                     'acc': f'{accuracy:.3f}',
                     'ppl': f'{perplexity:.1f}',
-                    'lr': f'{optimizers[0].param_groups[0]["lr"]:.2e}',
-                    'grad_norm': f'{total_norm:.4f}'  # Add gradient norm
+                    'lr': f'{optimizers[0].param_groups[0]["lr"]:.2e}'
                 })
 
             # Evaluation
