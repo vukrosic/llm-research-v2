@@ -792,9 +792,9 @@ def setup_distributed():
         import datetime
         timeout = datetime.timedelta(seconds=30)  # 30 second timeout
         try:
-            dist.init_process_group(backend=BACKEND, timeout=timeout, device_id=gpu_id)
-        except TypeError:
             dist.init_process_group(backend=BACKEND, timeout=timeout)
+        except TypeError:
+            dist.init_process_group(backend=BACKEND)
         print(f"🔧 Rank {rank}: Process group initialized")
 
         # Test barrier
@@ -1124,7 +1124,7 @@ def main_ddp():
     
     # Initialize process group
     try:
-        dist.init_process_group(backend="nccl", device_id=local_rank)
+        dist.init_process_group(backend="nccl")
     except TypeError:
         dist.init_process_group(backend="nccl")
     
