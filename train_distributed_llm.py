@@ -9,7 +9,7 @@ GPU_IDS = [0, 1]                # Specific GPU IDs to use (e.g., [0,1,2,3] for 4
 
 # MODEL SCALING FOR MULTI-GPU - MEMORY OPTIMIZED FOR RTX 4090 (24GB VRAM each)
 # Adjust batch size and learning rate based on number of GPUs
-BASE_BATCH_SIZE = 8             # Very conservative batch size to avoid OOM
+BASE_BATCH_SIZE = 24            # Very conservative batch size to avoid OOM
 BASE_LR = 0.01                  # Adjusted learning rate
 SCALE_LR_WITH_GPUS = True       # Whether to scale LR with number of GPUs
 
@@ -53,6 +53,7 @@ def print_memory_usage(device_id=0):
         print(f"🔍 GPU {device_id} Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, {total:.2f}GB total")
 
 @dataclass
+@dataclass
 class ModelConfig:
     # Model architecture - MEMORY OPTIMIZED FOR 4090s
     d_model: int = 384              # Moderate size to fit memory
@@ -60,7 +61,7 @@ class ModelConfig:
     n_layers: int = 6               # Fewer layers to save memory
     d_ff: int = 1536                # Smaller feed-forward
     batch_size: int = BASE_BATCH_SIZE  # per GPU batch size
-    max_steps: int = 10000          # More training steps
+    max_steps: int = 2500           # half of single-GPU (5000)
 
     # Training parameters
     gradient_accumulation_steps: int = 4  # More accumulation, smaller memory footprint
@@ -68,8 +69,8 @@ class ModelConfig:
 
     # Data parameters - BALANCED FOR MEMORY
     max_seq_len: int = 512          # Shorter sequences to save memory
-    num_documents: int = 3000       # Moderate number of documents
-    max_tokens: int = 1000000       # 1M tokens
+    num_documents: int = 2000       # match single-GPU
+    max_tokens: int = 500000        # match single-GPU
 
     # Evaluation
     eval_every: int = 500
