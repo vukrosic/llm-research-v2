@@ -469,7 +469,7 @@ class MinimalLLM(nn.Module):
         logits = self.lm_head(x)
         return logits
 
-def evaluate_model(model: nn.Module, val_loader: DataLoader, config: ModelConfig):
+def evaluate_model(model: nn.Module, val_loader: DataLoader, config: ModelConfig, rank: int, world_size: int):
     """Evaluate model performance with distributed reduction"""
     model.eval()
     total_loss = 0
@@ -499,9 +499,10 @@ def evaluate_model(model: nn.Module, val_loader: DataLoader, config: ModelConfig
     total_tokens = torch.tensor(total_tokens, device=device)
     total_correct = torch.tensor(total_correct, device=device)
     
-    dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_correct, op=dist.ReduceOp.SUM)
+    if world_size > 1 and dist.is_initialized():
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_correct, op=dist.ReduceOp.SUM)
 
     avg_loss = total_loss.item() / total_tokens.item()
     accuracy = total_correct.item() / total_tokens.item()
@@ -510,8 +511,8 @@ def evaluate_model(model: nn.Module, val_loader: DataLoader, config: ModelConfig
     model.train()
     return {'val_loss': avg_loss, 'val_accuracy': accuracy, 'val_perplexity': perplexity}
 
-def setup_distributed_optimizers(model: nn.Module, config: ModelConfig):
-    """Setup distributed Muon and DistAdam optimizers"""
+def setup_distributed_optimizers(model: nn.Module, config: ModelConfig, world_size: int):
+    """Setup optimizers. Use distributed optimizers when distributed is initialized, otherwise fallback to AdamW."""
     muon_params = []
     adamw_params = []
 
@@ -524,15 +525,25 @@ def setup_distributed_optimizers(model: nn.Module, config: ModelConfig):
         else:
             adamw_params.append(param)
 
-    rank = dist.get_rank()
-    if rank == 0:
-        print(f"  Muon parameters: {sum(p.numel() for p in muon_params):,}")
-        print(f"  DistAdam parameters: {sum(p.numel() for p in adamw_params):,}")
+    rank = dist.get_rank() if dist.is_initialized() else 0
 
-    muon_optimizer = DistributedMuon(muon_params, lr=config.muon_lr, momentum=0.95)
-    adamw_optimizer = DistAdam(adamw_params, lr=config.muon_lr*0.1, weight_decay=config.weight_decay)
-
-    return [muon_optimizer, adamw_optimizer]
+    if world_size > 1 and dist.is_initialized():
+        if rank == 0:
+            print(f"  Muon parameters: {sum(p.numel() for p in muon_params):,}")
+            print(f"  DistAdam parameters: {sum(p.numel() for p in adamw_params):,}")
+        muon_optimizer = DistributedMuon(muon_params, lr=config.muon_lr, momentum=0.95)
+        adamw_optimizer = DistAdam(adamw_params, lr=config.muon_lr*0.1, weight_decay=config.weight_decay)
+        return [muon_optimizer, adamw_optimizer]
+    else:
+        if rank == 0:
+            print("  Using single-process AdamW optimizer")
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config.muon_lr,
+            weight_decay=config.weight_decay,
+            betas=(0.9, 0.999)
+        )
+        return [optimizer]
 
 class DistributedSampler:
     """Improved distributed sampler with better load balancing"""
@@ -583,10 +594,8 @@ class DistributedSampler:
     def set_epoch(self, epoch):
         self.epoch = epoch
 
-def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataLoader):
+def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataLoader, rank: int, world_size: int):
     """Train the model with distributed optimizers"""
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
     
     if rank == 0:
         print(f"\n🚀 Training Small model with Distributed Muon optimizer")
@@ -595,26 +604,28 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
     # Initialize model
     set_seed(42 + rank)  # Different seed per rank
     model = MinimalLLM(config)
-    device = torch.device('cuda', rank)
+    device = torch.device('cuda', rank) if torch.cuda.is_available() else torch.device('cpu')
     model = model.to(device)
 
     # Check memory after model loading
-    if rank == 0:
+    if rank == 0 and torch.cuda.is_available():
         print_memory_usage(rank)
 
     # Synchronize model parameters across all ranks
-    for param in model.parameters():
-        dist.broadcast(param.detach(), 0)
+    if world_size > 1 and dist.is_initialized():
+        for param in model.parameters():
+            dist.broadcast(param.detach(), 0)
 
     total_params = sum(p.numel() for p in model.parameters())
     if rank == 0:
         print(f"  📊 Total parameters: {total_params:,}")
-        print_memory_usage(rank)
+        if torch.cuda.is_available():
+            print_memory_usage(rank)
 
-    # Setup distributed optimizers
-    optimizers = setup_distributed_optimizers(model, config)
+    # Setup optimizers
+    optimizers = setup_distributed_optimizers(model, config, world_size)
     
-    if rank == 0:
+    if rank == 0 and torch.cuda.is_available():
         print_memory_usage(rank)
 
     # Learning rate schedule
@@ -643,7 +654,9 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
 
     while step < config.max_steps:
         # Set epoch for proper shuffling
-        train_sampler.set_epoch(step // len(train_loader))
+        sampler = getattr(train_loader, "sampler", None)
+        if hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(step // len(train_loader))
         
         for batch_idx, (x, y) in enumerate(train_loader):
             if step >= config.max_steps:
@@ -653,7 +666,7 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             
             # Synchronize before forward pass to ensure all ranks are ready
-            if step % 100 == 0:
+            if world_size > 1 and dist.is_initialized() and step % 100 == 0:
                 dist.barrier()
 
             # Forward pass with gradient accumulation
@@ -672,7 +685,8 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
             # Optimizer step after accumulation
             if (step + 1) % config.gradient_accumulation_steps == 0:
                 # Synchronize gradients across all ranks
-                dist.barrier()
+                if world_size > 1 and dist.is_initialized():
+                    dist.barrier()
                 
                 if config.use_amp:
                     for optimizer in optimizers:
@@ -694,7 +708,7 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
                         scheduler.step()
                 
                 # Clear cache periodically to prevent memory fragmentation
-                if step % 500 == 0:
+                if torch.cuda.is_available() and step % 500 == 0:
                     torch.cuda.empty_cache()
 
             # Logging (only rank 0)
@@ -714,7 +728,7 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
 
             # Evaluation
             if step % config.eval_every == 0 and step > 0:
-                eval_metrics = evaluate_model(model, val_loader, config)
+                eval_metrics = evaluate_model(model, val_loader, config, rank, world_size)
                 if rank == 0:
                     print(f"\nStep {step}: Val Loss: {eval_metrics['val_loss']:.4f}, "
                           f"Val Acc: {eval_metrics['val_accuracy']:.4f}, "
@@ -735,7 +749,7 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
         print(f"  ⏱️ Training completed in {training_time:.1f} seconds")
 
     # Final evaluation
-    final_eval = evaluate_model(model, val_loader, config)
+    final_eval = evaluate_model(model, val_loader, config, rank, world_size)
     if rank == 0:
         print(f"  📊 Final - Loss: {final_eval['val_loss']:.4f}, "
               f"Acc: {final_eval['val_accuracy']:.4f}, PPL: {final_eval['val_perplexity']:.2f}")
@@ -748,29 +762,31 @@ def setup_distributed():
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", NUM_GPUS))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    
+
     print(f"🔧 Rank {rank}: Setting up distributed training...")
-    
+
     # Validate GPU availability
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available!")
-    
+        print("❌ CUDA is not available!")
+        # Fallback to single CPU mode if no CUDA
+        return 0, 1, 0, torch.device("cpu")
+
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
-        print(f"⚠️ Requested {world_size} GPUs but only {available_gpus} available!")
+        print(f"⚠️ Requested {world_size} GPUs but only {available_gpus} available! Using {available_gpus}.")
         world_size = available_gpus
-    
+
     # Set the specific GPU for this process
     if local_rank < len(GPU_IDS):
         gpu_id = GPU_IDS[local_rank]
     else:
         gpu_id = local_rank
-    
+
     torch.cuda.set_device(gpu_id)
     device = torch.device("cuda", gpu_id)
-    
+
     print(f"🔧 Rank {rank}: Using GPU {gpu_id}")
-    
+
     # Initialize process group with timeout
     try:
         import datetime
@@ -780,11 +796,12 @@ def setup_distributed():
         except TypeError:
             dist.init_process_group(backend=BACKEND, timeout=timeout)
         print(f"🔧 Rank {rank}: Process group initialized")
-        
+
         # Test barrier
-        dist.barrier()
-        print(f"🔧 Rank {rank}: Barrier test passed")
-        
+        if dist.is_initialized():
+            dist.barrier()
+            print(f"🔧 Rank {rank}: Barrier test passed")
+
     except Exception as e:
         print(f"❌ Rank {rank}: Distributed setup failed: {e}")
         print(f"🔄 Rank {rank}: Falling back to single GPU mode")
@@ -792,23 +809,26 @@ def setup_distributed():
         world_size = 1
         rank = 0
         local_rank = 0
-    
+        # Ensure device is set correctly for fallback
+        device = torch.device("cuda", gpu_id) if torch.cuda.is_available() else torch.device("cpu")
+
     if rank == 0:
         print(f"🔧 Distributed setup complete: {world_size} GPUs, backend={BACKEND}")
         print(f"🎯 Using GPUs: {GPU_IDS[:world_size]}")
-    
+
     return rank, world_size, local_rank, device
 
 def main():
     rank, world_size, local_rank, device = setup_distributed()
-    
+
     master_process = (rank == 0)
     
     # Check system
     if master_process:
-        print(f"🔍 Device: CUDA")
-        print(f"GPU: {torch.cuda.get_device_name()}")
-        print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        print(f"🔍 Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
+        if torch.cuda.is_available():
+            print(f"GPU: {torch.cuda.get_device_name()}")
+            print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
         print(f"World size: {world_size} GPUs")
 
     # Set seed
@@ -853,10 +873,10 @@ def main():
         train_dataset, 
         batch_size=config.batch_size,
         sampler=train_sampler,
-        num_workers=min(4, os.cpu_count() // world_size),  # Balanced workers per GPU
-        pin_memory=True,
-        persistent_workers=True,  # Keep workers alive between epochs
-        prefetch_factor=2,  # Prefetch batches
+        num_workers=min(4, (os.cpu_count() or 1) // max(1, world_size)),  # Balanced workers per GPU
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=True if (os.cpu_count() or 0) > 1 else False,  # Keep workers alive between epochs
+        prefetch_factor=2 if (os.cpu_count() or 0) > 1 else 2,
         drop_last=True  # Ensure consistent batch sizes across ranks
     )
     
@@ -864,10 +884,10 @@ def main():
         val_dataset,
         batch_size=config.batch_size,
         sampler=val_sampler,
-        num_workers=min(2, os.cpu_count() // world_size),
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2,
+        num_workers=min(2, (os.cpu_count() or 1) // max(1, world_size)),
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=True if (os.cpu_count() or 0) > 1 else False,
+        prefetch_factor=2 if (os.cpu_count() or 0) > 1 else 2,
         drop_last=False
     )
 
@@ -877,7 +897,7 @@ def main():
 
     # Train model
     start_time = time.time()
-    model, final_metrics = train_model(config, train_loader, val_loader)
+    model, final_metrics = train_model(config, train_loader, val_loader, rank, world_size)
     total_time = time.time() - start_time
 
     if master_process:
