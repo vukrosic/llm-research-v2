@@ -34,18 +34,17 @@ logger = get_logger(__name__)
 
 @dataclass
 class ModelConfig:
-    # Model architecture - OPTIMIZED FOR RTX 4090s
-    d_model: int = 384              # Moderate size to fit memory
+    # Smaller model for debugging
+    d_model: int = 256              # Reduced from 384
     n_heads: int = 8
-    num_kv_heads: Optional[int] = None # For Grouped Query Attention (GQA)
-    n_layers: int = 6               # Fewer layers to save memory
-    d_ff: int = 1536                # Smaller feed-forward
-    batch_size: int = 12            # per GPU batch size (can be larger with Accelerate)
-    max_steps: int = 2500           # Training steps
+    n_layers: int = 4               # Reduced from 6
+    d_ff: int = 1024                # Reduced from 1536
+    batch_size: int = 8             # Reduced from 12
+    max_steps: int = 1000           # Reduced for faster debugging
 
-    # Training parameters
-    gradient_accumulation_steps: int = 4  # Gradient accumulation
-    learning_rate: float = 0.001    # Learning rate
+    # Training parameters - FIXED VALUES
+    gradient_accumulation_steps: int = 4
+    learning_rate: float = 1e-4  # Reduced from 1e-3
 
     # Data parameters
     max_seq_len: int = 512          # Sequence length
@@ -56,10 +55,10 @@ class ModelConfig:
     eval_every: int = 500
     eval_steps: int = 100
 
-    # Regularization
-    weight_decay: float = 0.1
+    # Regularization - FIXED VALUES
+    weight_decay: float = 0.01   # Reduced from 0.1
     dropout: float = 0.1
-    grad_clip: float = 1.0
+    grad_clip: float = 5.0       # Increased from 1.0
 
     # Technical
     use_amp: bool = True            # Mixed precision
@@ -347,26 +346,19 @@ def evaluate_model(model: nn.Module, val_loader: DataLoader, config: ModelConfig
     return {'val_loss': avg_loss, 'val_accuracy': accuracy, 'val_perplexity': perplexity}
 
 def setup_optimizers(model: nn.Module, config: ModelConfig):
-    """Setup optimizers with Muon for linear layers and AdamW for others"""
-    muon_params = []
-    adamw_params = []
-
-    for name, param in model.named_parameters():
-        if (param.ndim == 2 and 
-            'token_embedding' not in name and 
-            'norm' not in name and 
-            param.requires_grad):
-            muon_params.append(param)
-        else:
-            adamw_params.append(param)
-
-    logger.info(f"  Muon parameters: {sum(p.numel() for p in muon_params):,}")
-    logger.info(f"  AdamW parameters: {sum(p.numel() for p in adamw_params):,}")
-
-    muon_optimizer = MuonOptimizer(muon_params, lr=config.learning_rate, momentum=0.95)
-    adamw_optimizer = torch.optim.AdamW(adamw_params, lr=config.learning_rate*0.1, weight_decay=config.weight_decay)
+    """Setup optimizers with better defaults"""
+    # Use AdamW for all parameters instead of mixing Muon and AdamW
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+        betas=(0.9, 0.95),  # Better beta values for language models
+        eps=1e-8
+    )
     
-    return [muon_optimizer, adamw_optimizer]
+    logger.info(f"  AdamW parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    return [optimizer]
 
 def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataLoader, accelerator: Accelerator):
     """Train the model with Accelerate"""
@@ -382,17 +374,19 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
     # Setup optimizers
     optimizers = setup_optimizers(model, config)
     
-    # Learning rate schedule
+    # Better learning rate schedule
     schedulers = []
     for optimizer in optimizers:
-        warmup_steps = config.max_steps // 20
+        warmup_steps = min(config.max_steps // 10, 1000)  # Cap warmup at 1000 steps
+        
         def lr_lambda(step):
             if step < warmup_steps:
                 return step / warmup_steps
             else:
+                # Cosine decay with longer tail
                 progress = (step - warmup_steps) / (config.max_steps - warmup_steps)
                 return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
-
+        
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         schedulers.append(scheduler)
 
@@ -449,7 +443,8 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
                     'loss': f'{loss.item():.4f}',
                     'acc': f'{accuracy:.3f}',
                     'ppl': f'{perplexity:.1f}',
-                    'lr': f'{optimizers[0].param_groups[0]["lr"]:.2e}'
+                    'lr': f'{optimizers[0].param_groups[0]["lr"]:.2e}',
+                    'grad_norm': f'{total_norm:.4f}'  # Add gradient norm
                 })
 
             # Evaluation
