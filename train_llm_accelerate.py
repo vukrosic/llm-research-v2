@@ -15,7 +15,6 @@ from typing import List, Optional
 import warnings
 import os
 import pickle
-import json
 warnings.filterwarnings('ignore')
 
 def set_seed(seed: int = 42):
@@ -36,7 +35,7 @@ class ModelConfig:
     n_layers: int = 6
     d_ff: int = 1536
     batch_size: int = 24
-    max_steps: int = 3000
+    max_steps: int = 5000
 
     # Training parameters
     gradient_accumulation_steps: int = 4
@@ -50,10 +49,6 @@ class ModelConfig:
     # Evaluation
     eval_every: int = 500
     eval_steps: int = 100
-    
-    # Checkpointing
-    save_every: int = 5000
-    checkpoint_dir: str = "checkpoints"
 
     # Regularization
     weight_decay: float = 0.1
@@ -352,45 +347,7 @@ def setup_muon_optimizer(model: nn.Module, config: ModelConfig):
 
     return [muon_optimizer, adamw_optimizer]
 
-def save_checkpoint(model: nn.Module, optimizers: list, schedulers: list, step: int, 
-                   config: ModelConfig, tokenizer, loss: float, checkpoint_dir: str):
-    """Save model checkpoint"""
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{step}")
-    os.makedirs(checkpoint_path, exist_ok=True)
-    
-    # Save model state
-    torch.save({
-        'step': step,
-        'model_state_dict': model.state_dict(),
-        'optimizer_states': [opt.state_dict() for opt in optimizers],
-        'scheduler_states': [sched.state_dict() for sched in schedulers],
-        'loss': loss,
-        'config': config
-    }, os.path.join(checkpoint_path, 'model.pt'))
-    
-    # Save tokenizer
-    tokenizer.save_pretrained(checkpoint_path)
-    
-    # Save config as JSON for easy reading
-    config_dict = {
-        'd_model': config.d_model,
-        'n_heads': config.n_heads,
-        'n_layers': config.n_layers,
-        'd_ff': config.d_ff,
-        'vocab_size': config.vocab_size,
-        'max_seq_len': config.max_seq_len,
-        'dropout': config.dropout
-    }
-    
-    with open(os.path.join(checkpoint_path, 'config.json'), 'w') as f:
-        json.dump(config_dict, f, indent=2)
-    
-    print(f"💾 Checkpoint saved at step {step} to {checkpoint_path}")
-    return checkpoint_path
-
-def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataLoader, tokenizer):
+def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataLoader):
     """Train the model with Muon optimizer"""
     print(f"\n🚀 Training Small model with Muon optimizer")
 
@@ -495,12 +452,6 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
 
                 if eval_metrics['val_loss'] < best_val_loss:
                     best_val_loss = eval_metrics['val_loss']
-            
-            # Save checkpoint
-            if step % config.save_every == 0 and step > 0:
-                current_loss = loss.item() * config.gradient_accumulation_steps
-                save_checkpoint(model, optimizers, schedulers, step, config, 
-                              tokenizer, current_loss, config.checkpoint_dir)
 
             step += 1
             if step % 100 == 0:
@@ -553,12 +504,8 @@ if __name__ == "__main__":
 
     # Train model
     start_time = time.time()
-    model, final_metrics = train_model(config, train_loader, val_loader, tokenizer)
+    model, final_metrics = train_model(config, train_loader, val_loader)
     total_time = time.time() - start_time
-    
-    # Save final checkpoint
-    final_checkpoint = save_checkpoint(model, [], [], config.max_steps, config, 
-                                     tokenizer, final_metrics['val_loss'], config.checkpoint_dir)
 
     print(f"\n🎉 TRAINING COMPLETED!")
     print(f"⏱️ Total time: {total_time/60:.1f} minutes")
